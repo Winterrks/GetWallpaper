@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "getw"
+version = "0.1.0"
+description = "Local web gallery for iWallpaper and Wallpaper Engine video wallpapers"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "waifucave" }]
+keywords = ["wallpaper", "wallpaper-engine", "iwallpaper", "gallery"]
+classifiers = [
+    "Environment :: Web Environment",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Desktop Environment",
+]
+
+[project.scripts]
+getw = "getw.cli:main"
+
+[tool.setuptools]
+packages = ["getw"]
+
+[tool.setuptools.package-data]
+getw = ["wallpaper_census.json"]

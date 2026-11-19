@@ -16,3 +16,8 @@ __pycache__/
 *.webm
 *.jpg
 .DS_Store
+
+# build artifacts
+dist/
+build/
+*.egg-info/

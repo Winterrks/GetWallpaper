@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""webui.py — local web UI to browse the iWallpaper and Wallpaper Engine catalogs.
+"""Local web gallery for iWallpaper and Wallpaper Engine video wallpapers.
 
-Usage:
-    python3 webui.py [port]        # default port 8000, opens your browser
+Run standalone with `python3 webui.py [port]`, or via the `getw` CLI
+(`getw start`).
 
 Sources:
-    iWallpaper       (Apple CloudKit public database, see FINDINGS.md)
-    Wallpaper Engine (Steam Workshop app 431960, video items only — see
-                      WALLPAPER_ENGINE_FINDINGS.md and we_source.py)
+    iWallpaper       (Apple CloudKit public database)
+    Wallpaper Engine (Steam Workshop app 431960, video items only)
 
 Endpoints:
     GET /                    grid page (source switch, search, hover-download)
@@ -17,8 +16,10 @@ Endpoints:
     GET /api/we/records      Wallpaper Engine video items (JSON)
     GET /we/thumb/<id>       Workshop preview (cached in we_thumbs/)
     GET /we/download/<id>    copy from local Workshop or steamcmd -> we_downloads/
-    GET /we/reveal/<id>      reveal a downloaded Workshop item in Finder
-    GET /reveal/<uuid>       reveal a downloaded iWallpaper file in Finder
+    GET /we/reveal/<id>      reveal a downloaded Workshop item in the file manager
+    GET /reveal/<uuid>       reveal a downloaded iWallpaper file in the file manager
+    GET|POST /api/settings   read/change the download folder
+    GET /progress/<kind>/<id> download progress for a tile
 
 The server binds to 127.0.0.1 only.
 """
@@ -26,7 +27,9 @@ The server binds to 127.0.0.1 only.
 import hashlib
 import json
 import os
+import pkgutil
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -36,19 +39,40 @@ import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import we_source
+try:                      # installed package
+    from . import we_source
+except ImportError:       # standalone checkout
+    import we_source
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-CENSUS = os.path.join(HERE, "wallpaper_census.json")
-THUMB_DIR = os.path.join(HERE, "thumbs")
-DECRYPT_SH = os.path.join(HERE, "decrypt.sh")
+PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+IS_PACKAGE = os.path.basename(PKG_DIR) == "getw"
+
+
+def default_data_dir():
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "GetWallapper")
+
+
+STATE_DIR = os.environ.get("GETW_DATA_DIR") or (
+    default_data_dir() if IS_PACKAGE else PKG_DIR)
+os.makedirs(STATE_DIR, exist_ok=True)
+we_source.configure_data_dir(STATE_DIR)
+
+CENSUS = os.path.join(PKG_DIR, "wallpaper_census.json")
+THUMB_DIR = os.path.join(STATE_DIR, "thumbs")
+AES_KEY_HEX = "4e534461746100000000000000000000"   # ASCII "NSData" zero-padded
 LOOKUP_URL = ("https://api.apple-cloudkit.com/database/1/"
               "iCloud.com.macosgame.iwallpaper/production/public/records/lookup")
 UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
                      r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\Z")
 
-SETTINGS_PATH = os.path.join(HERE, "settings.json")
-INDEX_DIR = os.path.join(HERE, "indexes")
+SETTINGS_PATH = os.path.join(STATE_DIR, "settings.json")
+INDEX_DIR = os.path.join(STATE_DIR, "indexes")
 DEFAULT_DOWNLOAD_ROOT = os.path.expanduser("~/Downloads/GetWallpaperGallery")
 
 
@@ -184,8 +208,8 @@ def _migrate_index(new_path, old_path, old_dir):
         pass
 
 
-_migrate_index(DL_INDEX, os.path.join(HERE, "downloads", "index.json"),
-               os.path.join(HERE, "downloads"))
+_migrate_index(DL_INDEX, os.path.join(STATE_DIR, "downloads", "index.json"),
+               os.path.join(STATE_DIR, "downloads"))
 
 
 def _load_index():
@@ -209,8 +233,21 @@ def mark_downloaded(uuid, path):
             json.dump(INDEX, fh, indent=0)
         os.replace(tmp, DL_INDEX)
 
-with open(CENSUS) as fh:
-    RECORDS = sorted(json.load(fh), key=lambda r: -(r.get("hotCount") or 0))
+def _load_census():
+    data = None
+    if __package__:
+        try:
+            data = pkgutil.get_data(__package__, "wallpaper_census.json")
+        except Exception:
+            data = None
+    if data is None:
+        with open(CENSUS, "rb") as fh:
+            data = fh.read()
+    return json.loads(data)
+
+
+_census = _load_census()
+RECORDS = sorted(_census, key=lambda r: -(r.get("hotCount") or 0))
 RECORDS = [{"id": r["recordName"],
             "title": r.get("tagsStr") or r["recordName"],
             "res": r.get("resolution") or "?",
@@ -223,8 +260,8 @@ RECORDS = [{"id": r["recordName"],
 WE_INDEX_PATH = os.path.join(INDEX_DIR, "we.json")
 _WE_INDEX_LOCK = threading.Lock()
 
-_migrate_index(WE_INDEX_PATH, os.path.join(HERE, "we_downloads", "index.json"),
-               os.path.join(HERE, "we_downloads"))
+_migrate_index(WE_INDEX_PATH, os.path.join(STATE_DIR, "we_downloads", "index.json"),
+               os.path.join(STATE_DIR, "we_downloads"))
 
 
 def _load_we_index():
@@ -376,6 +413,45 @@ _DL_LOCKS = {}
 _DL_LOCKS_GUARD = threading.Lock()
 
 
+def decrypt_asset(src, dst):
+    """AES-128-ECB decrypt an iWallpaper asset (key "NSData" + zero pad)."""
+    ossl = shutil.which("openssl")
+    if ossl:
+        proc = subprocess.run(
+            [ossl, "enc", "-aes-128-ecb", "-d", "-K", AES_KEY_HEX,
+             "-in", src, "-out", dst],
+            capture_output=True)
+        return proc.returncode == 0
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        raise RuntimeError(
+            "openssl not found and the `cryptography` package is not installed. "
+            "Install OpenSSL (Windows: https://slproweb.com/products/Win32OpenSSL.html) "
+            "or run: pip install cryptography")
+    key = bytes.fromhex(AES_KEY_HEX)
+    with open(src, "rb") as fh:
+        data = fh.read()
+    dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    out = dec.update(data) + dec.finalize()
+    pad = out[-1]
+    if 0 < pad <= 16:
+        out = out[:-pad]
+    with open(dst, "wb") as fh:
+        fh.write(out)
+    return True
+
+
+def reveal_in_file_manager(path):
+    if sys.platform == "darwin":
+        reveal_in_file_manager(path)
+    elif os.name == "nt":
+        subprocess.run(["explorer", "/select,", os.path.normpath(path)],
+                       check=False)
+    else:
+        subprocess.run(["xdg-open", os.path.dirname(path)], check=False)
+
+
 def fetch_video(uuid):
     """Fetch + decrypt a wallpaper; returns (path, title, cached)."""
     with _DL_LOCKS_GUARD:
@@ -406,11 +482,10 @@ def fetch_video(uuid):
                             set_progress("iw", uuid, d, t, ph))
             if aes:
                 set_progress("iw", uuid, None, None, "decrypting")
-                rc = subprocess.run([DECRYPT_SH, tmp_asset, target],
-                                    capture_output=True).returncode
+                ok = decrypt_asset(tmp_asset, target)
                 os.remove(tmp_asset)
-                if rc != 0:
-                    raise RuntimeError("decrypt failed (exit %d)" % rc)
+                if not ok:
+                    raise RuntimeError("decrypt failed")
             else:
                 os.replace(tmp_asset, target)
         except Exception:
@@ -1067,7 +1142,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"ok": False, "error": "file not found"}),
                        "application/json")
             return
-        subprocess.run(["open", "-R", path], check=False)
+        reveal_in_file_manager(path)
         self._send(200, json.dumps({"ok": True, "file": os.path.basename(path)}),
                    "application/json")
 
@@ -1128,7 +1203,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"ok": False, "error": "file not found"}),
                        "application/json")
             return
-        subprocess.run(["open", "-R", path], check=False)
+        reveal_in_file_manager(path)
         self._send(200, json.dumps({"ok": True, "file": os.path.basename(path)}),
                    "application/json")
 
@@ -1148,21 +1223,26 @@ class Handler(BaseHTTPRequestHandler):
                    "application/json", [("Cache-Control", "no-store")])
 
 
-def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+def start(port=8000, open_browser=True):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = "http://127.0.0.1:%d/" % port
-    print("iWallpaper browser: %s" % url)
-    print("thumbnail cache:    %s" % THUMB_DIR)
-    print("downloads:          %s" % DOWNLOAD_ROOT)
+    print("GetWallapper: %s" % url)
+    print("state dir:    %s" % STATE_DIR)
+    print("downloads:    %s" % DOWNLOAD_ROOT)
     print("Ctrl-C to stop.")
-    webbrowser.open(url)
+    if open_browser:
+        webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+
+
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    start(port)
 
 
 if __name__ == "__main__":

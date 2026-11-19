@@ -47,11 +47,59 @@ with `WE_STEAM_ACCOUNT=<account>`.
 
 Browsing Wallpaper Engine metadata and thumbnails requires no Steam login.
 
+## Install
+
+From a release artifact (see GitHub Releases):
+
+```bash
+pipx install getw-0.1.0-py3-none-any.whl
+# or
+python3 -m pip install --user getw-0.1.0-py3-none-any.whl
+```
+
+Or run the standalone zipapp without installing (needs Python 3.10+ only):
+
+```bash
+python3 getw.pyz start
+```
+
+From a checkout:
+
+```bash
+python3 -m getw start
+```
+
+## CLI
+
+```bash
+getw start [--port 8000] [--no-browser]   # run the web UI
+getw setup                                # choose download folder, check SteamCMD
+getw login [--account NAME]               # log SteamCMD in (Wallpaper Engine downloads)
+getw status                               # data dir, download folder, caches, Steam login
+```
+
+`getw setup` creates the download folder if needed and reports whether SteamCMD
+and a cached Steam session are present. `getw login` runs SteamCMD interactively
+so you can enter your password and Steam Guard code once.
+
+## Platform support
+
+| Feature | macOS | Linux | Windows |
+|---|---|---|---|
+| Browse both catalogues + thumbnails | ✅ | ✅ | ✅ |
+| iWallpaper downloads + decrypt | ✅ (`openssl`) | ✅ (`openssl`) | ✅ (`openssl` on PATH, or `pip install cryptography`) |
+| Wallpaper Engine downloads | ✅ SteamCMD + owned copy | ✅ SteamCMD + owned copy | ✅ SteamCMD + owned copy |
+| Reveal in file manager | Finder | xdg-open (folder) | Explorer (select) |
+
+The app is pure Python (standard library), served to your browser on
+`127.0.0.1`; it has no OS-specific UI dependencies. SteamCMD paths and the
+cached Steam account are detected per platform.
+
 ## Run
 
 ```bash
-python3 webui.py            # opens http://127.0.0.1:8000
-python3 webui.py 8123       # custom port
+python3 -m getw start              # opens http://127.0.0.1:8000
+python3 -m getw start --port 8123  # custom port
 ```
 
 ## Download folder

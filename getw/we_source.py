@@ -60,6 +60,15 @@ VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv")
 _STEAMCMD_LOCK = threading.Lock()   # steamcmd cannot run two instances at once
 
 
+def configure_data_dir(path):
+    """Point caches/downloads at a user data directory (used by the package)."""
+    global THUMB_DIR, CACHE, DL_DIR
+    THUMB_DIR = os.path.join(path, "we_thumbs")
+    CACHE = os.path.join(path, "we_catalog.json")
+    DL_DIR = os.path.join(path, "we_downloads")
+    os.makedirs(THUMB_DIR, exist_ok=True)
+
+
 # ------------------------------------------------------------------ fetch ---
 
 def _get(url, timeout=30):
@@ -120,10 +129,11 @@ def _norm(item):
 
 
 def _cache_path(rating):
+    base_dir = os.path.dirname(CACHE)
     if rating in RATINGS:
         return CACHE if rating == "Everyone" else os.path.join(
-            HERE, "we_catalog_%s.json" % rating.lower())
-    return os.path.join(HERE, "we_catalog_all.json")
+            base_dir, "we_catalog_%s.json" % rating.lower())
+    return os.path.join(base_dir, "we_catalog_all.json")
 
 
 def _load_cache(rating="Everyone"):
@@ -269,13 +279,40 @@ def _workshop_roots():
     env = os.environ.get("WE_WORKSHOP_DIR")
     if env:
         roots.append(env)
-    roots += [
-        os.path.expanduser("~/Library/Application Support/Steam/steamapps/"
-                           "workshop/content/431960"),
-        os.path.expanduser("~/.steam/steam/steamapps/workshop/content/431960"),
-        os.path.expanduser("~/Steam/steamapps/workshop/content/431960"),
-    ]
+    if sys.platform == "darwin":
+        roots.append(os.path.expanduser(
+            "~/Library/Application Support/Steam/steamapps/workshop/"
+            "content/431960"))
+    elif os.name == "nt":
+        for base in (os.environ.get("PROGRAMFILES(X86)"),
+                     os.environ.get("PROGRAMFILES")):
+            if base:
+                roots.append(os.path.join(base, "Steam", "steamapps",
+                                          "workshop", "content", "431960"))
+        roots.append(os.path.expanduser(
+            "~\\Steam\\steamapps\\workshop\\content\\431960"))
+    else:
+        for base in (os.path.expanduser("~/.steam/steam"),
+                     os.path.expanduser("~/.local/share/Steam")):
+            roots.append(os.path.join(base, "steamapps", "workshop",
+                                      "content", "431960"))
     return [r for r in roots if r]
+
+
+def _default_content_root():
+    """Steam's default Workshop content folder for the current OS."""
+    if sys.platform == "darwin":
+        return os.path.expanduser(
+            "~/Library/Application Support/Steam/steamapps/workshop/"
+            "content/431960")
+    if os.name == "nt":
+        base = (os.environ.get("PROGRAMFILES(X86)")
+                or os.environ.get("PROGRAMFILES")
+                or r"C:\Program Files (x86)")
+        return os.path.join(base, "Steam", "steamapps", "workshop",
+                            "content", "431960")
+    return os.path.expanduser(
+        "~/.steam/steam/steamapps/workshop/content/431960")
 
 
 def _video_in(folder):
@@ -318,19 +355,35 @@ def _tail(text, lines=3):
 
 def _steam_account():
     """Steam account name for steamcmd login: env override, else the last
-    account cached by the Steam client / steamcmd on this Mac."""
+    account cached by the Steam client / steamcmd on this machine."""
     env = os.environ.get("WE_STEAM_ACCOUNT")
     if env:
         return env
-    path = os.path.expanduser(
-        "~/Library/Application Support/Steam/config/loginusers.vdf")
-    try:
-        with open(path) as fh:
-            text = fh.read()
-    except OSError:
-        return None
-    m = re.search(r'"AccountName"\s*"([^"]+)"', text)
-    return m.group(1) if m else None
+    candidates = []
+    if sys.platform == "darwin":
+        candidates.append(os.path.expanduser(
+            "~/Library/Application Support/Steam/config/loginusers.vdf"))
+    elif os.name == "nt":
+        for base in (os.environ.get("PROGRAMFILES(X86)"),
+                     os.environ.get("PROGRAMFILES")):
+            if base:
+                candidates.append(os.path.join(base, "Steam", "config",
+                                               "loginusers.vdf"))
+    else:
+        candidates += [
+            os.path.expanduser("~/.steam/steam/config/loginusers.vdf"),
+            os.path.expanduser("~/.local/share/Steam/config/loginusers.vdf"),
+        ]
+    for path in candidates:
+        try:
+            with open(path) as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = re.search(r'"AccountName"\s*"([^"]+)"', text)
+        if m:
+            return m.group(1)
+    return None
 
 
 def _folder_bytes(folder):
@@ -384,10 +437,10 @@ def download(item_id, title, on_progress=None, expected_bytes=0, dest_dir=None):
 
             threading.Thread(target=_reader, daemon=True).start()
 
-            workshop_root = os.path.expanduser(
-                "~/Library/Application Support/Steam/steamapps/workshop")
+            content = os.path.join(_default_content_root(), item_id)
+            workshop_root = os.path.dirname(os.path.dirname(
+                _default_content_root()))
             staging = os.path.join(workshop_root, "downloads")
-            content = os.path.join(workshop_root, "content", "431960", item_id)
             baseline = _folder_bytes(staging)
             last_pct = -1
             while proc.poll() is None:
