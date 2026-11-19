@@ -767,12 +767,41 @@ const SPIN = '<span class="spin"></span>';
 
 // Load thumbnails visible first: a tight band assigns src (high priority),
 // while a wider band keeps already-loaded images around before dropping them.
+const pendingLoads = new Set();
+let settleTimer = null;
+let lastScrollTs = 0;
+
+window.addEventListener('scroll', () => { lastScrollTs = Date.now(); }, { passive: true });
+
+function assignSrc(img) {
+  if (img.getAttribute('src')) return;
+  img.fetchPriority = 'high';
+  img.src = img.dataset.src;
+}
+
+function scheduleSettle() {
+  if (settleTimer) clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => {
+    settleTimer = null;
+    for (const img of [...pendingLoads]) {
+      pendingLoads.delete(img);
+      if (!img.isConnected) continue;
+      const r = img.getBoundingClientRect();
+      if (r.bottom > -600 && r.top < window.innerHeight + 600) assignSrc(img);
+    }
+  }, 250);
+}
+
 const loadIO = new IntersectionObserver(entries => {
   for (const e of entries) {
+    if (!e.isIntersecting) continue;
     const img = e.target;
-    if (e.isIntersecting && !img.getAttribute('src')) {
-      img.fetchPriority = 'high';
-      img.src = img.dataset.src;
+    if (Date.now() - lastScrollTs < 200) {
+      // scrolling: defer so stale tiles don't queue ahead of what you stop on
+      pendingLoads.add(img);
+      scheduleSettle();
+    } else {
+      assignSrc(img);
     }
   }
 }, { rootMargin: '600px 0px' });

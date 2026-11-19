@@ -54,7 +54,8 @@ CACHE_TTL = 6 * 3600
 _CACHE_MEM = {}
 PAGE_SIZE = 30
 MAX_PAGES = 1000
-FETCH_WORKERS = max(1, min(16, int(os.environ.get("GETW_FETCH_WORKERS", "10"))))  # Steam clamps every Workshop browse query to 1,000 pages
+FETCH_WORKERS = max(1, min(16, int(os.environ.get("GETW_FETCH_WORKERS", "10"))))
+THUMB_WIDTH = max(96, min(1024, int(os.environ.get("GETW_THUMB_WIDTH", "400"))))  # Steam clamps every Workshop browse query to 1,000 pages
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 RES_RE = re.compile(r"(\d+)\s*[x\u00d7]\s*(\d+)")
@@ -253,7 +254,8 @@ def fetch_more(pages=8, rating="Everyone", persist=True):
 
 # ------------------------------------------------------------- thumbnails ---
 
-def thumbnail(item_id, preview_url, max_width=640):
+def thumbnail(item_id, preview_url, max_width=None):
+    max_width = THUMB_WIDTH if max_width is None else max_width
     """Returns (path, created)."""
     os.makedirs(THUMB_DIR, exist_ok=True)
     for ext in ("jpg", "gif", "png", "webp"):
