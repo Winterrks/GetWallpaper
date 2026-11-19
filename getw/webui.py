@@ -346,6 +346,56 @@ def we_more(pages=8, rating="Everyone"):
             "exhausted": exhausted, "reset": reset}
 
 
+# background catalogue fill: keep paging until Steam's 1,000-page cap
+_FILL = {}
+_FILL_LOCK = threading.Lock()
+
+
+def fill_status(rating):
+    with _FILL_LOCK:
+        st = _FILL.get(rating)
+        if not st:
+            return {"running": False, "total": 0, "exhausted": False,
+                    "error": None}
+        return dict(st)
+
+
+def start_fill(rating):
+    rating = rating if rating in WE_RATINGS else "Everyone"
+    with _FILL_LOCK:
+        st = _FILL.get(rating)
+        if st and st.get("running"):
+            return dict(st)
+        _FILL[rating] = {"running": True, "total": 0, "exhausted": False,
+                         "error": None}
+    threading.Thread(target=_fill_worker, args=(rating,), daemon=True).start()
+    return fill_status(rating)
+
+
+def _fill_worker(rating):
+    zero = 0
+    try:
+        for _ in range(200):
+            with _WE_LOCK:
+                added, total, exhausted, reset = we_source.fetch_more(
+                    pages=8, rating=rating)
+                items = we_source.catalog(rating=rating)
+                WE_ITEMS.update({r["id"]: r for r in items})
+            with _FILL_LOCK:
+                _FILL.setdefault(rating, {}).update(
+                    total=total, exhausted=exhausted, error=None)
+            if exhausted:
+                break
+            zero = zero + 1 if not added else 0
+            time.sleep(5 if zero >= 3 else 1.5)
+    except Exception as exc:
+        with _FILL_LOCK:
+            _FILL.setdefault(rating, {}).update(error=str(exc))
+    finally:
+        with _FILL_LOCK:
+            _FILL.setdefault(rating, {})["running"] = False
+
+
 def we_item(item_id):
     rec = WE_ITEMS.get(item_id)
     if rec is None:
@@ -684,6 +734,8 @@ let source = 'iw';
 let weExhausted = false;
 let weLoading = false;
 let weInitialLoading = false;
+let fillTimer = null;
+let fillStatus = { running: false, total: 0, exhausted: false };
 let filterBurst = 0;            // consecutive auto-batches while searching
 const FILTER_BURST_MAX = 5;     // then wait for another scroll/wheel gesture
 let searchTimer = null;
@@ -776,6 +828,8 @@ async function load(src) {
   }
   weInitialLoading = false;
   updateMore();
+  if (src === 'we') startFill();
+  else stopFillPoll();
 }
 
 function setSource(src) {
@@ -783,6 +837,8 @@ function setSource(src) {
   weExhausted = false;
   weLoading = false;
   filterBurst = 0;
+  stopFillPoll();
+  fillStatus = { running: false, total: 0, exhausted: false };
   ratingEl.classList.toggle('hidden', src !== 'we');
   srcBtns.forEach(b => b.classList.toggle('on', b.dataset.src === src));
   q.value = '';
@@ -790,9 +846,59 @@ function setSource(src) {
 }
 
 function updateMore() {
-  const show = source === 'we' && !weExhausted && records.length > 0;
+  const show = source === 'we' && records.length > 0 &&
+               (!weExhausted || fillStatus.running);
   moreBar.classList.toggle('hidden', !show);
-  moreLabel.textContent = weLoading ? 'Loading more…' : '';
+  if (weLoading) moreLabel.textContent = 'Loading more…';
+  else if (fillStatus.running)
+    moreLabel.textContent = 'Indexing catalog… ' +
+      records.length.toLocaleString() + ' items';
+  else moreLabel.textContent = '';
+}
+
+function stopFillPoll() {
+  if (fillTimer) { clearInterval(fillTimer); fillTimer = null; }
+}
+
+async function startFill() {
+  stopFillPoll();
+  fillStatus = { running: true, total: records.length, exhausted: false };
+  try {
+    await fetch('/api/we/fill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rating: ratingEl.value })
+    });
+  } catch (e) {
+    fillStatus.running = false;
+  }
+  updateMore();
+  fillTimer = setInterval(pollFill, 4000);
+  pollFill();
+}
+
+async function pollFill() {
+  if (source !== 'we') { stopFillPoll(); return; }
+  try {
+    const res = await fetch('/api/we/fill?rating=' +
+      encodeURIComponent(ratingEl.value));
+    if (!res.ok) return;
+    fillStatus = await res.json();
+    if (fillStatus.total > records.length) {
+      const res2 = await fetch('/api/we/records?rating=' +
+        encodeURIComponent(ratingEl.value) + '&offset=' + records.length);
+      if (res2.ok) {
+        const j = await res2.json();
+        if (j.items && j.items.length) {
+          records = records.concat(j.items);
+          computeFiltered();
+          if (nearPageBottom()) growGrid();
+        }
+      }
+    }
+    updateMore();
+    if (!fillStatus.running) stopFillPoll();
+  } catch (e) { /* next tick */ }
 }
 
 function nearBottom() {
@@ -1129,8 +1235,18 @@ class Handler(BaseHTTPRequestHandler):
                     urllib.parse.urlparse(self.path).query)
                 refresh = query.get("refresh", ["0"])[0] == "1"
                 rating = query.get("rating", ["Everyone"])[0]
+                offset = query.get("offset", [None])[0]
                 try:
-                    payload = json.dumps(we_records(refresh, rating))
+                    rows = we_records(refresh, rating)
+                    if offset is not None:
+                        try:
+                            off = max(0, int(offset))
+                        except ValueError:
+                            off = 0
+                        payload = json.dumps({"items": rows[off:],
+                                              "total": len(rows)})
+                    else:
+                        payload = json.dumps(rows)
                 except Exception as exc:
                     self._send(500, json.dumps({"ok": False, "error": str(exc)}),
                                "application/json")
@@ -1149,6 +1265,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send(200, payload, "application/json",
                            [("Cache-Control", "no-store")])
+            elif path == "/api/we/fill":
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                rating = query.get("rating", ["Everyone"])[0]
+                self._send(200, json.dumps(fill_status(rating)),
+                           "application/json", [("Cache-Control", "no-store")])
             elif path == "/api/settings":
                 self._send(200, json.dumps({
                     "download_root": DOWNLOAD_ROOT,
@@ -1180,6 +1302,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/we/fill":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                rating = payload.get("rating") or "Everyone"
+            except ValueError:
+                self._send(400, json.dumps({"ok": False}),
+                           "application/json")
+                return
+            self._send(200, json.dumps(start_fill(rating)),
+                       "application/json")
+            return
         if path != "/api/settings":
             self._send(404, "not found")
             return

@@ -18,7 +18,7 @@ It runs entirely on your machine: one Python process, a browser tab on
 - Smart search: comma-separated terms are **AND**ed and matched against titles
   and Workshop tags — `anime, girls, raiden`
 - Wallpaper Engine rating filter: Everyone (default), Questionable, Mature, All
-- Infinite scroll through Workshop pages (no "load more" button)
+- Infinite scroll through Workshop pages, plus a background fill that indexes the whole Workshop slice (up to Steam's 30,000-item cap)
 - Configurable download folder; files are named after the wallpaper title
 - Thumbnail caches capped at 1 GiB per source, oldest evicted first
 
