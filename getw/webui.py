@@ -142,6 +142,30 @@ def _dir_stats(path):
     return {"mb": round(total / 1e6, 1), "count": count}
 
 
+_INTERACTIVE_LOCK = threading.Lock()
+_INTERACTIVE = {"count": 0}
+
+
+def _enter_interactive():
+    with _INTERACTIVE_LOCK:
+        _INTERACTIVE["count"] += 1
+
+
+def _leave_interactive():
+    with _INTERACTIVE_LOCK:
+        _INTERACTIVE["count"] = max(0, _INTERACTIVE["count"] - 1)
+
+
+def _interactive_active():
+    with _INTERACTIVE_LOCK:
+        return _INTERACTIVE["count"] > 0
+
+
+def _prefill_gate():
+    while _interactive_active() and PF.get("running"):
+        time.sleep(0.15)
+
+
 PF = {"running": False, "done": 0, "total": 0, "source": "", "error": None}
 _PF_LOCK = threading.Lock()
 
@@ -191,8 +215,9 @@ def _prefill_worker():
                 return
             if _dir_stats(THUMB_DIR)["mb"] * 1e6 >= THUMB_CAP:
                 break
+            _prefill_gate()
             batch = RECORDS[i:i + 16]
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(fetch_iw, batch))
             _pf_set(done=min(len(RECORDS), PF.get("done", 0) + len(batch)))
 
@@ -203,8 +228,9 @@ def _prefill_worker():
                 return
             if _dir_stats(we_source.THUMB_DIR)["mb"] * 1e6 >= THUMB_CAP:
                 break
+            _prefill_gate()
             batch = items[i:i + 16]
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(fetch_we, batch))
             _pf_set(done=min(len(items), PF.get("done", 0) + len(batch)))
     except Exception as exc:
@@ -1553,7 +1579,11 @@ class Handler(BaseHTTPRequestHandler):
         if not UUID_RE.fullmatch(uuid):
             self._send(404, "bad record id")
             return
-        path, created = fetch_thumbnail(uuid)
+        _enter_interactive()
+        try:
+            path, created = fetch_thumbnail(uuid)
+        finally:
+            _leave_interactive()
         if not path:
             self._send(404, "no thumbnail")
             return
@@ -1606,7 +1636,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "bad item id")
             return
         rec = we_item(item_id)
-        path, created = we_source.thumbnail(item_id, rec["preview"] if rec else "")
+        _enter_interactive()
+        try:
+            path, created = we_source.thumbnail(item_id,
+                                                rec["preview"] if rec else "")
+        finally:
+            _leave_interactive()
         if not path:
             self._send(404, "no thumbnail")
             return
