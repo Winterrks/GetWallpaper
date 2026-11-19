@@ -378,7 +378,7 @@ def _fill_worker(rating):
         for _ in range(200):
             with _WE_LOCK:
                 added, total, exhausted, reset = we_source.fetch_more(
-                    pages=8, rating=rating)
+                    pages=24, rating=rating)
                 items = we_source.catalog(rating=rating)
                 WE_ITEMS.update({r["id"]: r for r in items})
             with _FILL_LOCK:
@@ -387,7 +387,7 @@ def _fill_worker(rating):
             if exhausted:
                 break
             zero = zero + 1 if not added else 0
-            time.sleep(5 if zero >= 3 else 1.5)
+            time.sleep(5 if zero >= 3 else 0.4)
     except Exception as exc:
         with _FILL_LOCK:
             _FILL.setdefault(rating, {}).update(error=str(exc))
@@ -873,7 +873,7 @@ async function startFill() {
     fillStatus.running = false;
   }
   updateMore();
-  fillTimer = setInterval(pollFill, 4000);
+  fillTimer = setInterval(pollFill, 1500);
   pollFill();
 }
 

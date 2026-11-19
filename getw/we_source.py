@@ -52,7 +52,8 @@ THUMB_DIR = os.path.join(HERE, "we_thumbs")
 DL_DIR = os.path.join(HERE, "we_downloads")
 CACHE_TTL = 6 * 3600
 PAGE_SIZE = 30
-MAX_PAGES = 1000  # Steam clamps every Workshop browse query to 1,000 pages
+MAX_PAGES = 1000
+FETCH_WORKERS = max(1, min(16, int(os.environ.get("GETW_FETCH_WORKERS", "10"))))  # Steam clamps every Workshop browse query to 1,000 pages
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 RES_RE = re.compile(r"(\d+)\s*[x\u00d7]\s*(\d+)")
@@ -172,7 +173,7 @@ def _collect(start_page, pages, rating="Everyone"):
     page_numbers = [p for p in range(start_page, start_page + pages)
                     if p <= MAX_PAGES]
     results = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
         futures = {pool.submit(_page_items, p, rating): p for p in page_numbers}
         for future in futures:
             page = futures[future]
