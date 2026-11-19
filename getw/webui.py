@@ -698,18 +698,27 @@ const CROSS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke
 const FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
 const SPIN = '<span class="spin"></span>';
 
-// Load thumbnails near the viewport; drop the src of images that scroll far
-// away so the browser releases their memory (they reload from cache on return).
-const io = new IntersectionObserver(entries => {
+// Load thumbnails visible first: a tight band assigns src (high priority),
+// while a wider band keeps already-loaded images around before dropping them.
+const loadIO = new IntersectionObserver(entries => {
   for (const e of entries) {
     const img = e.target;
-    if (e.isIntersecting) {
-      if (!img.getAttribute('src')) img.src = img.dataset.src;
-    } else if (img.getAttribute('src')) {
-      img.removeAttribute('src');
+    if (e.isIntersecting && !img.getAttribute('src')) {
+      img.fetchPriority = 'high';
+      img.src = img.dataset.src;
     }
   }
-}, { rootMargin: '1500px 0px' });
+}, { rootMargin: '600px 0px' });
+
+const dropIO = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    const img = e.target;
+    if (!e.isIntersecting && img.getAttribute('src')) {
+      img.removeAttribute('src');
+      img.fetchPriority = 'low';
+    }
+  }
+}, { rootMargin: '2500px 0px' });
 
 // Infinite scroll for the Wallpaper Engine source: when the sentinel at the
 // bottom of the grid approaches the viewport, fetch the next batch of pages.
@@ -899,7 +908,8 @@ function card(r) {
   img.alt = r.title;
   img.addEventListener('click', () => openLightbox(r));
   img.addEventListener('error', () => el.classList.add('broken'));
-  io.observe(img);
+  loadIO.observe(img);
+  dropIO.observe(img);
   el.querySelector('.t').textContent = r.title;
   el.querySelector('.s').textContent = r.meta;
   el.querySelector('.cover').addEventListener('click', e => {
