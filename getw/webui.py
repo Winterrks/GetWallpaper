@@ -204,12 +204,16 @@ def _prefill_worker():
     def fetch_iw(rec):
         try:
             fetch_thumbnail(rec["id"])
+        except Exception:
+            pass
         finally:
             _pf_bump()
 
     def fetch_we(rec):
         try:
             we_source.thumbnail(rec["id"], rec["preview"])
+        except Exception:
+            pass
         finally:
             _pf_bump()
 
@@ -222,8 +226,11 @@ def _prefill_worker():
                 break
             _prefill_gate()
             batch = RECORDS[i:i + 16]
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(fetch_iw, batch))
+            try:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(fetch_iw, batch))
+            except Exception:
+                time.sleep(1)
 
         items = we_source.catalog(rating="Everyone")
         _pf_set(source="Wallpaper Engine", total=len(items), done=0)
@@ -234,8 +241,11 @@ def _prefill_worker():
                 break
             _prefill_gate()
             batch = items[i:i + 16]
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(fetch_we, batch))
+            try:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(fetch_we, batch))
+            except Exception:
+                time.sleep(1)
     except Exception as exc:
         _pf_set(error=str(exc))
     finally:
