@@ -1,148 +1,177 @@
 # GetWallapper
 
-A local web gallery for live wallpapers from two sources:
+A local web gallery to **browse and download live wallpapers** from two sources:
 
-- **iWallpaper** (macOS app, Apple CloudKit public catalogue) — browse the full
-  census, download the encrypted video assets and decrypt them locally.
-- **Wallpaper Engine** (Steam Workshop, app `431960`) — browse trending *video*
-  wallpapers, filter by content rating, and download them through SteamCMD
-  (requires owning Wallpaper Engine on Steam).
+- **iWallpaper** — the Mac app's public CloudKit catalogue (2,123 videos)
+- **Wallpaper Engine** — video wallpapers from the Steam Workshop (app `431960`)
 
-Everything runs on your Mac. No account, API key, or cloud service is needed for
-browsing; the server binds to `127.0.0.1` only.
+It runs entirely on your machine: one Python process, a browser tab on
+`127.0.0.1`, no accounts, no telemetry.
+
+![GetWallapper grid](docs/grid.png)
 
 ## Features
 
-- 4-column grid of poster thumbnails (1 GiB on-disk cache per source, oldest
-  evicted first)
-- Smart search: comma-separated terms, **all must match** (AND), each matched
-  against titles and Wallpaper Engine tags — `anime, girls, raiden`
-- Infinite scroll (Wallpaper Engine pages through Steam Workshop; iWallpaper
-  loads its full census at once)
-- Content-rating selector for Wallpaper Engine: Everyone (default),
-  Questionable, Mature, All
-- Hover a tile → yellow download tile; click → spinner with live progress
-  (`42%`, `Decrypting…`, `Copying…`); downloaded tiles are green with a ✓
-- Hover a downloaded tile → blue folder tile; click reveals the file in Finder;
-  if the file was deleted outside the app, the tile resets for re-download
-- Configurable download folder via the ⚙ icon (default
-  `~/Downloads/GetWallpaperGallery/`)
-- Files are named after the wallpaper title
+- 4-column thumbnail grid with hover-to-download tiles
+- Download states: yellow (hover) → spinner with progress → green ✓; hover a
+  downloaded tile to reveal it in Finder / Explorer / file manager
+- Smart search: comma-separated terms are **AND**ed and matched against titles
+  and Workshop tags — `anime, girls, raiden`
+- Wallpaper Engine rating filter: Everyone (default), Questionable, Mature, All
+- Infinite scroll through Workshop pages (no "load more" button)
+- Configurable download folder; files are named after the wallpaper title
+- Thumbnail caches capped at 1 GiB per source, oldest evicted first
 
-## Requirements
-
-- macOS (uses `open -R` for Finder reveal and `openssl` for decryption)
-- Python 3.10+ (standard library only — no pip installs)
-- For Wallpaper Engine downloads: [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)
-  and a Steam account that owns Wallpaper Engine.
-
-```bash
-brew install steamcmd
-steamcmd +login <your-account> +quit   # once; Steam Guard asks for a code
-```
-
-The app auto-detects the cached account (`loginusers.vdf`) and passes
-`+login` to SteamCMD, so subsequent downloads need no interaction. Override
-with `WE_STEAM_ACCOUNT=<account>`.
-
-Browsing Wallpaper Engine metadata and thumbnails requires no Steam login.
+![Wallpaper Engine source](docs/wallpaper-engine.png)
 
 ## Install
 
-From a release artifact (see GitHub Releases):
+### Option A — pip / pipx (recommended)
+
+Download `getw-0.1.0-py3-none-any.whl` from the
+[latest release](https://github.com/waifucave/GetWallapper/releases/latest) and:
 
 ```bash
-pipx install getw-0.1.0-py3-none-any.whl
-# or
-python3 -m pip install --user getw-0.1.0-py3-none-any.whl
+pipx install ./getw-0.1.0-py3-none-any.whl
+# or: python3 -m pip install --user ./getw-0.1.0-py3-none-any.whl
 ```
 
-Or run the standalone zipapp without installing (needs Python 3.10+ only):
+### Option B — no install (zipapp)
+
+Download `getw.pyz` from the release and run it with Python 3.10+:
 
 ```bash
 python3 getw.pyz start
 ```
 
-From a checkout:
+### Option C — from source
 
 ```bash
+git clone https://github.com/waifucave/GetWallapper.git
+cd GetWallapper
 python3 -m getw start
 ```
 
-## CLI
+## Quick start
 
 ```bash
-getw start [--port 8000] [--no-browser]   # run the web UI
-getw setup                                # choose download folder, check SteamCMD
-getw login [--account NAME]               # log SteamCMD in (Wallpaper Engine downloads)
-getw status                               # data dir, download folder, caches, Steam login
+getw setup     # pick a download folder, check SteamCMD (optional)
+getw start     # opens http://127.0.0.1:8000
 ```
 
-`getw setup` creates the download folder if needed and reports whether SteamCMD
-and a cached Steam session are present. `getw login` runs SteamCMD interactively
-so you can enter your password and Steam Guard code once.
+`getw setup` is optional — the app works immediately with the default folder at
+`~/Downloads/GetWallpaperGallery/`.
+
+![Download progress](docs/progress.png)
+
+### Download folder
+
+Click the ⚙ icon in the top-right corner to change it. New folders are created
+and write-checked before saving; the choice is stored in `settings.json` in the
+app data directory.
+
+![Settings dialog](docs/settings.png)
+
+## Wallpaper Engine setup
+
+Browsing Workshop metadata and thumbnails needs **no login**. Downloading does —
+Steam only serves Workshop files to accounts that own Wallpaper Engine.
+
+1. Install SteamCMD:
+   - macOS: `brew install steamcmd`
+   - Linux: your distro package, or the
+     [official instructions](https://developer.valvesoftware.com/wiki/SteamCMD)
+   - Windows: [SteamCMD download](https://developer.valvesoftware.com/wiki/SteamCMD),
+     add it to `PATH`
+2. Log in once:
+
+   ```bash
+   getw login
+   ```
+
+   Steam Guard asks for a code the first time; the session is cached afterwards.
+   The app auto-detects the cached account (`loginusers.vdf`) on each download.
+
+Already have Workshop items downloaded by another tool? Point
+`WE_WORKSHOP_DIR` at your `steamapps/workshop/content/431960` folder and the app
+will copy from there instead.
+
+**iWallpaper needs no login, account, or purchase** — its catalogue is public and
+asset URLs are pre-signed.
 
 ## Platform support
 
 | Feature | macOS | Linux | Windows |
 |---|---|---|---|
-| Browse both catalogues + thumbnails | ✅ | ✅ | ✅ |
-| iWallpaper downloads + decrypt | ✅ (`openssl`) | ✅ (`openssl`) | ✅ (`openssl` on PATH, or `pip install cryptography`) |
-| Wallpaper Engine downloads | ✅ SteamCMD + owned copy | ✅ SteamCMD + owned copy | ✅ SteamCMD + owned copy |
-| Reveal in file manager | Finder | xdg-open (folder) | Explorer (select) |
+| Browse, search, thumbnails, UI | ✅ | ✅ | ✅ |
+| iWallpaper downloads + decrypt | ✅ `openssl` | ✅ `openssl` | ✅ `openssl` on PATH, or `pip install cryptography` |
+| Wallpaper Engine downloads | ✅ SteamCMD + owned copy | ✅ | ✅ |
+| Reveal file | Finder | xdg-open | Explorer |
+| Steam account auto-detect | ✅ | ✅ | ✅ |
 
-The app is pure Python (standard library), served to your browser on
-`127.0.0.1`; it has no OS-specific UI dependencies. SteamCMD paths and the
-cached Steam account are detected per platform.
+Pure Python 3.10+ (standard library only). State lives in:
 
-## Run
+- macOS: `~/Library/Application Support/GetWallapper/`
+- Windows: `%APPDATA%\GetWallapper\`
+- Linux: `~/.local/share/GetWallapper/`
+
+Override with `GETW_DATA_DIR`.
+
+## CLI
 
 ```bash
-python3 -m getw start              # opens http://127.0.0.1:8000
-python3 -m getw start --port 8123  # custom port
+getw start [--port 8000] [--no-browser]   # run the web UI
+getw setup                                # download folder + environment checks
+getw login [--account NAME]               # SteamCMD login for Workshop downloads
+getw status                               # data dir, download folder, caches, Steam login
 ```
 
-## Download folder
+## Troubleshooting
 
-Default: `~/Downloads/GetWallpaperGallery/`. Click the ⚙ icon in the top-right
-corner to change it; the path is validated (created if missing, write-tested)
-and saved to `settings.json` next to the app.
+| Symptom | Fix |
+|---|---|
+| Workshop download fails with `Not logged on` | `getw login` (needs an account that owns Wallpaper Engine) |
+| Workshop download fails with `Download item … failed (Failure)` | The item was removed/private/region-locked, or another SteamCMD was running; retry once |
+| iWallpaper download says decrypt failed | Install OpenSSL (Windows) or `pip install cryptography` |
+| `Address already in use` | `getw start --port 8123` |
+| A tile shows not-downloaded after you moved files | The app tracks files by absolute path; re-download or move files back |
+| Workshop list looks stale | Delete `we_catalog*.json` in the data dir, or call `/api/we/records?refresh=1` |
+| Thumbnails missing | They re-fetch on view; caches are capped at 1 GiB per source |
 
-Downloaded-file tracking is stored in `indexes/` as absolute paths, so changing
-the folder does not forget files downloaded earlier.
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `GETW_DATA_DIR` | Override the state directory (settings, indexes, caches) |
+| `WE_STEAM_ACCOUNT` | Steam account name for SteamCMD (default: auto-detected) |
+| `WE_WORKSHOP_DIR` | Existing `steamapps/workshop/content/431960` folder to copy from |
+| `THUMB_CAP_BYTES` | Thumbnail cache cap per source (default `1073741824` = 1 GiB) |
 
 ## How it works
 
 | Source | Catalogue | Thumbnails | Video |
 |---|---|---|---|
-| iWallpaper | `wallpaper_census.json` (bundled metadata snapshot) | Apple CloudKit asset URLs | AES-128-ECB asset, decrypted with `decrypt.sh` |
-| Wallpaper Engine | Steam Workshop browse page (embedded JSON, `requiredtags[]=Video` + rating) | Steam image CDN (`preview_url`, downscaled) | `steamcmd workshop_download_item 431960 <id>` |
+| iWallpaper | bundled census metadata (`getw/wallpaper_census.json`) | CloudKit asset URLs | AES-128-ECB asset, decrypted locally |
+| Wallpaper Engine | public Workshop browse pages, parsed from embedded JSON | Steam image CDN (`preview_url`, downscaled) | `steamcmd workshop_download_item 431960 <id>` |
 
-Wallpaper Engine pages are fetched eight at a time (240 items) in parallel and
-cached for six hours in `we_catalog*.json`.
+Endpoints: `/`, `/api/records`, `/thumb/<uuid>`, `/download/<uuid>`,
+`/reveal/<uuid>`, `/progress/iw/<uuid>`, `/api/we/records`,
+`/we/thumb/<id>`, `/we/download/<id>`, `/we/reveal/<id>`, `/progress/we/<id>`,
+`/api/settings` (GET/POST), `/health`.
 
-### Environment variables
+## Building from source
 
-| Variable | Purpose |
-|---|---|
-| `WE_STEAM_ACCOUNT` | Steam account name for SteamCMD (default: auto-detected) |
-| `WE_WORKSHOP_DIR` | Existing `steamapps/workshop/content/431960` folder to copy from instead of downloading |
-| `THUMB_CAP_BYTES` | Thumbnail cache cap per source (default `1073741824` = 1 GiB) |
-
-### Endpoints
-
-- `GET /` — UI
-- `GET /api/records`, `/thumb/<uuid>`, `/download/<uuid>`, `/reveal/<uuid>`, `/progress/iw/<uuid>`
-- `GET /api/we/records?rating=…`, `/we/thumb/<id>`, `/we/download/<id>`, `/we/reveal/<id>`, `/progress/we/<id>`
-- `GET|POST /api/settings` — read/change `download_root`
-- `GET /health`
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install build
+python -m build --outdir dist        # wheel + sdist
+```
 
 ## Notes
 
-- Downloads are for personal use. Wallpaper Engine Workshop items belong to
-  their authors; do not redistribute them. iWallpaper assets are likewise
-  third-party content.
-- The Wallpaper Engine source is unofficial and relies on Steam's public
-  Workshop pages; it may need updating if Steam changes their markup.
-- Scene-type Wallpaper Engine wallpapers are intentionally excluded — they are
-  packed `.pkg` projects, not plain video files.
+- Downloads are for personal use. Workshop items belong to their authors and
+  iWallpaper content is third-party; do not redistribute.
+- The Wallpaper Engine source is unofficial and depends on Steam's public
+  Workshop page markup; it may need updating if Steam changes it.
+- Scene-type Wallpaper Engine wallpapers are excluded — they are packed `.pkg`
+  projects, not plain video files.
