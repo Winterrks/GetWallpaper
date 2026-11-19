@@ -1,4 +1,4 @@
-# GetWallapper
+# GetWallpaper
 
 A local web gallery to **browse and download live wallpapers** from two sources:
 
@@ -8,7 +8,7 @@ A local web gallery to **browse and download live wallpapers** from two sources:
 It runs entirely on your machine: one Python process, a browser tab on
 `127.0.0.1`, no accounts, no telemetry.
 
-![GetWallapper grid](docs/grid.png)
+![GetWallpaper grid](docs/grid.png)
 
 ## Features
 
@@ -29,7 +29,7 @@ It runs entirely on your machine: one Python process, a browser tab on
 ### Option A — pip / pipx (recommended)
 
 Download the `.whl` from the
-[latest release](https://github.com/waifucave/GetWallapper/releases/latest) and:
+[latest release](https://github.com/waifucave/GetWallpaper/releases/latest) and:
 
 ```bash
 pipx install ./getw-*.whl
@@ -47,8 +47,8 @@ python3 getw.pyz start
 ### Option C — from source
 
 ```bash
-git clone https://github.com/waifucave/GetWallapper.git
-cd GetWallapper
+git clone https://github.com/waifucave/GetWallpaper.git
+cd GetWallpaper
 python3 -m getw start
 ```
 
@@ -111,9 +111,9 @@ asset URLs are pre-signed.
 
 Pure Python 3.10+ (standard library only). State lives in:
 
-- macOS: `~/Library/Application Support/GetWallapper/`
-- Windows: `%APPDATA%\GetWallapper\`
-- Linux: `~/.local/share/GetWallapper/`
+- macOS: `~/Library/Application Support/GetWallpaper/`
+- Windows: `%APPDATA%\GetWallpaper\`
+- Linux: `~/.local/share/GetWallpaper/`
 
 Override with `GETW_DATA_DIR`.
 

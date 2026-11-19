@@ -55,11 +55,18 @@ def default_data_dir():
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "GetWallapper")
+    return os.path.join(base, "GetWallpaper")
 
 
 STATE_DIR = os.environ.get("GETW_DATA_DIR") or (
     default_data_dir() if IS_PACKAGE else PKG_DIR)
+if IS_PACKAGE:
+    _legacy = STATE_DIR.replace("GetWallpaper", "GetWallapper")
+    if not os.path.exists(STATE_DIR) and os.path.exists(_legacy):
+        try:
+            os.rename(_legacy, STATE_DIR)
+        except OSError:
+            pass
 os.makedirs(STATE_DIR, exist_ok=True)
 we_source.configure_data_dir(STATE_DIR)
 
@@ -520,7 +527,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>iWallpaper library</title>
+<title>GetWallpaper</title>
 <style>
   :root { --bg:#0f0f12; --card:#1a1a1f; --line:#2a2a31; --txt:#e8e8ea; --dim:#9a9aa2; --yellow:#ffd400; }
   * { box-sizing:border-box; }
@@ -625,7 +632,7 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>iWallpaper library</h1>
+  <h1>GetWallpaper</h1>
   <div id="src">
     <button data-src="iw" class="on">iWallpaper</button>
     <button data-src="we">Wallpaper Engine</button>
@@ -1311,7 +1318,7 @@ class Handler(BaseHTTPRequestHandler):
 def start(port=8000, open_browser=True):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = "http://127.0.0.1:%d/" % port
-    print("GetWallapper: %s" % url)
+    print("GetWallpaper: %s" % url)
     print("state dir:    %s" % STATE_DIR)
     print("downloads:    %s" % DOWNLOAD_ROOT)
     print("Ctrl-C to stop.")

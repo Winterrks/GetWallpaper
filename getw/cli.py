@@ -1,4 +1,4 @@
-"""getw — command line entry point for GetWallapper."""
+"""getw — command line entry point for GetWallpaper."""
 
 import argparse
 import os
@@ -44,7 +44,7 @@ def _cmd_start(args):
 def _cmd_setup(args):
     from . import webui
 
-    print("GetWallapper setup")
+    print("GetWallpaper setup")
     print("  data dir:        %s" % webui.STATE_DIR)
     print("  download folder: %s" % webui.DOWNLOAD_ROOT)
     answer = input("New download folder [Enter to keep]: ").strip()
@@ -100,7 +100,7 @@ def _dir_size(path):
 def _cmd_status(args):
     from . import webui
 
-    print("GetWallapper %s" % __version__)
+    print("GetWallpaper %s" % __version__)
     print("  data dir:         %s" % webui.STATE_DIR)
     print("  download folder:  %s" % webui.DOWNLOAD_ROOT)
     print("  iWallpaper files: %d downloaded" % len(webui.INDEX))
@@ -116,7 +116,7 @@ def _cmd_status(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        prog="getw", description="GetWallapper — live wallpaper gallery")
+        prog="getw", description="GetWallpaper — live wallpaper gallery")
     parser.add_argument("--version", action="version",
                         version="getw " + __version__)
     sub = parser.add_subparsers(dest="command")
