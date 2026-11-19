@@ -167,6 +167,10 @@ pip install build
 python -m build --outdir dist        # wheel + sdist
 ```
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Notes
 
 - Downloads are for personal use. Workshop items belong to their authors and
