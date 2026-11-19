@@ -1,0 +1,1169 @@
+#!/usr/bin/env python3
+"""webui.py — local web UI to browse the iWallpaper and Wallpaper Engine catalogs.
+
+Usage:
+    python3 webui.py [port]        # default port 8000, opens your browser
+
+Sources:
+    iWallpaper       (Apple CloudKit public database, see FINDINGS.md)
+    Wallpaper Engine (Steam Workshop app 431960, video items only — see
+                      WALLPAPER_ENGINE_FINDINGS.md and we_source.py)
+
+Endpoints:
+    GET /                    grid page (source switch, search, hover-download)
+    GET /api/records         iWallpaper census metadata (JSON)
+    GET /thumb/<uuid>        iWallpaper thumbnail (fetched on demand, cached)
+    GET /download/<uuid>     lookup -> download -> decrypt -> downloads/<title>.<ext>
+    GET /api/we/records      Wallpaper Engine video items (JSON)
+    GET /we/thumb/<id>       Workshop preview (cached in we_thumbs/)
+    GET /we/download/<id>    copy from local Workshop or steamcmd -> we_downloads/
+    GET /we/reveal/<id>      reveal a downloaded Workshop item in Finder
+    GET /reveal/<uuid>       reveal a downloaded iWallpaper file in Finder
+
+The server binds to 127.0.0.1 only.
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import we_source
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CENSUS = os.path.join(HERE, "wallpaper_census.json")
+THUMB_DIR = os.path.join(HERE, "thumbs")
+DECRYPT_SH = os.path.join(HERE, "decrypt.sh")
+LOOKUP_URL = ("https://api.apple-cloudkit.com/database/1/"
+              "iCloud.com.macosgame.iwallpaper/production/public/records/lookup")
+UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\Z")
+
+SETTINGS_PATH = os.path.join(HERE, "settings.json")
+INDEX_DIR = os.path.join(HERE, "indexes")
+DEFAULT_DOWNLOAD_ROOT = os.path.expanduser("~/Downloads/GetWallpaperGallery")
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_PATH) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+SETTINGS = _load_settings()
+DOWNLOAD_ROOT = os.path.abspath(os.path.expanduser(
+    SETTINGS.get("download_root") or DEFAULT_DOWNLOAD_ROOT))
+
+
+def ensure_download_root():
+    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
+    return DOWNLOAD_ROOT
+
+
+def set_download_root(path):
+    """Validate, create and persist a new download folder."""
+    global DOWNLOAD_ROOT
+    path = os.path.abspath(os.path.expanduser(str(path).strip()))
+    os.makedirs(path, exist_ok=True)
+    probe = os.path.join(path, ".getwallpaper-write-test")
+    with open(probe, "w") as fh:
+        fh.write("ok")
+    os.remove(probe)
+    DOWNLOAD_ROOT = path
+    SETTINGS["download_root"] = path
+    tmp = SETTINGS_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(SETTINGS, fh, indent=1)
+    os.replace(tmp, SETTINGS_PATH)
+    return path
+
+
+os.makedirs(THUMB_DIR, exist_ok=True)
+os.makedirs(INDEX_DIR, exist_ok=True)
+ensure_download_root()
+
+THUMB_CAP = int(os.environ.get("THUMB_CAP_BYTES", 1 << 30))  # 1 GiB per cache
+_CACHE_LOCK = threading.Lock()
+
+
+def enforce_cache_cap(directory, cap=None):
+    """Delete the oldest files in `directory` until total size <= cap."""
+    cap = THUMB_CAP if cap is None else cap
+    with _CACHE_LOCK:
+        try:
+            entries, total = [], 0
+            with os.scandir(directory) as scan:
+                for entry in scan:
+                    try:
+                        if entry.is_file():
+                            st = entry.stat()
+                            entries.append((st.st_mtime, st.st_size, entry.path))
+                            total += st.st_size
+                    except OSError:
+                        pass
+            if total <= cap:
+                return
+            entries.sort(key=lambda e: e[0])
+            removed = freed = 0
+            for _mtime, size, path in entries:
+                if total <= cap:
+                    break
+                try:
+                    os.remove(path)
+                    total -= size
+                    removed += 1
+                    freed += size
+                except OSError:
+                    pass
+            if removed:
+                print("thumb cache pruned: %d files, %.1f MB freed (%s)"
+                      % (removed, freed / 1e6, directory), file=sys.stderr)
+        except OSError as exc:
+            print("thumb cache prune failed: %s" % exc, file=sys.stderr)
+
+# --- download progress -------------------------------------------------------
+
+_PROGRESS_LOCK = threading.Lock()
+_PROGRESS = {}
+
+
+def set_progress(kind, item_id, done=None, total=None, phase=None):
+    with _PROGRESS_LOCK:
+        now = time.time()
+        key = (kind, item_id)
+        cur = _PROGRESS.get(key, {})
+        if done is not None:
+            cur["done"] = done
+        if total is not None:
+            cur["total"] = total
+        if phase is not None:
+            cur["phase"] = phase
+        cur["ts"] = now
+        _PROGRESS[key] = cur
+        for k in [k for k, v in _PROGRESS.items()
+                  if now - v.get("ts", 0) > 3600]:
+            _PROGRESS.pop(k, None)
+
+
+def get_progress(kind, item_id):
+    with _PROGRESS_LOCK:
+        cur = _PROGRESS.get((kind, item_id))
+        if not cur:
+            return {}
+        cur = dict(cur)
+    done, total = cur.get("done") or 0, cur.get("total") or 0
+    cur["pct"] = round(done * 100 / total) if total else None
+    return cur
+
+DL_INDEX = os.path.join(INDEX_DIR, "iw.json")
+_INDEX_LOCK = threading.Lock()
+
+
+def _migrate_index(new_path, old_path, old_dir):
+    """Convert a legacy filename-based index into absolute paths."""
+    if os.path.exists(new_path) or not os.path.exists(old_path):
+        return
+    try:
+        with open(old_path) as fh:
+            data = json.load(fh)
+        converted = {k: os.path.join(old_dir, os.path.basename(v))
+                     for k, v in data.items()}
+        with open(new_path, "w") as fh:
+            json.dump(converted, fh, indent=0)
+    except (OSError, ValueError):
+        pass
+
+
+_migrate_index(DL_INDEX, os.path.join(HERE, "downloads", "index.json"),
+               os.path.join(HERE, "downloads"))
+
+
+def _load_index():
+    try:
+        with open(DL_INDEX) as fh:
+            data = json.load(fh)
+        return {k: v for k, v in data.items()
+                if os.path.isabs(v) and os.path.exists(v)}
+    except (OSError, ValueError):
+        return {}
+
+
+INDEX = _load_index()
+
+
+def mark_downloaded(uuid, path):
+    with _INDEX_LOCK:
+        INDEX[uuid] = path
+        tmp = DL_INDEX + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(INDEX, fh, indent=0)
+        os.replace(tmp, DL_INDEX)
+
+with open(CENSUS) as fh:
+    RECORDS = sorted(json.load(fh), key=lambda r: -(r.get("hotCount") or 0))
+RECORDS = [{"id": r["recordName"],
+            "title": r.get("tagsStr") or r["recordName"],
+            "res": r.get("resolution") or "?",
+            "mb": round((r.get("videoBytes") or 0) / 1e6, 1),
+            "dur": r.get("durationSec") or 0,
+            "hot": r.get("hotCount") or 0} for r in RECORDS]
+
+# --- Wallpaper Engine (Steam Workshop) source --------------------------------
+
+WE_INDEX_PATH = os.path.join(INDEX_DIR, "we.json")
+_WE_INDEX_LOCK = threading.Lock()
+
+_migrate_index(WE_INDEX_PATH, os.path.join(HERE, "we_downloads", "index.json"),
+               os.path.join(HERE, "we_downloads"))
+
+
+def _load_we_index():
+    try:
+        with open(WE_INDEX_PATH) as fh:
+            data = json.load(fh)
+        return {k: v for k, v in data.items()
+                if os.path.isabs(v) and os.path.exists(v)}
+    except (OSError, ValueError):
+        return {}
+
+
+WE_INDEX = _load_we_index()
+
+# prune thumbnail caches at startup (oldest-first, 1 GiB cap each)
+os.makedirs(we_source.THUMB_DIR, exist_ok=True)
+enforce_cache_cap(THUMB_DIR)
+enforce_cache_cap(we_source.THUMB_DIR)
+
+
+def we_mark_downloaded(item_id, filename):
+    with _WE_INDEX_LOCK:
+        WE_INDEX[item_id] = filename
+        tmp = WE_INDEX_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(WE_INDEX, fh, indent=0)
+        os.replace(tmp, WE_INDEX_PATH)
+
+
+_WE_LOCK = threading.Lock()
+WE_ITEMS = we_source.known_items()
+WE_RATINGS = ("Everyone", "Questionable", "Mature", "All")
+
+
+def _we_rows(items):
+    with _WE_INDEX_LOCK:
+        done = {i for i, f in WE_INDEX.items()
+                if os.path.exists(f)}
+    return [{"id": r["id"],
+             "title": r["title"],
+             "meta": "%s · %.1f MB · %s subs" % (r["res"], r["mb"], r["subs"]),
+             "tags": " ".join(r.get("tags", [])),
+             "api": "/we",
+             "downloaded": r["id"] in done} for r in items]
+
+
+def we_records(refresh=False, rating="Everyone"):
+    """Normalized Workshop video items + downloaded flags for the grid."""
+    rating = rating if rating in WE_RATINGS else "Everyone"
+    with _WE_LOCK:
+        items = we_source.catalog(pages=8, refresh=refresh, rating=rating)
+        WE_ITEMS.update({r["id"]: r for r in items})
+    return _we_rows(items)
+
+
+def we_more(pages=8, rating="Everyone"):
+    """Next batch: only items not already in the cache, plus new total."""
+    rating = rating if rating in WE_RATINGS else "Everyone"
+    with _WE_LOCK:
+        added, total, exhausted, reset = we_source.fetch_more(pages=pages,
+                                                              rating=rating)
+        items = we_source.catalog(rating=rating)
+        WE_ITEMS.update({r["id"]: r for r in items})
+    return {"items": _we_rows(added), "total": total,
+            "exhausted": exhausted, "reset": reset}
+
+
+def we_item(item_id):
+    rec = WE_ITEMS.get(item_id)
+    if rec is None:
+        we_records()
+        rec = WE_ITEMS.get(item_id)
+    return rec
+
+
+# ---------------------------------------------------------------- helpers ---
+
+def cloudkit_lookup(uuid):
+    body = json.dumps({"records": [{"recordName": uuid}]}).encode()
+    req = urllib.request.Request(LOOKUP_URL, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        payload = json.load(resp)
+    records = payload.get("records") or []
+    if not records or "fields" not in records[0]:
+        raise RuntimeError("record not found (server said: %s)"
+                           % json.dumps(payload)[:200])
+    return records[0]["fields"]
+
+
+def field(fields, name, default=""):
+    v = fields.get(name)
+    if isinstance(v, dict):
+        v = v.get("value")
+    return v if v is not None else default
+
+
+def asset_url(fields, name):
+    v = field(fields, name, None)
+    if isinstance(v, dict) and v.get("downloadURL"):
+        return v["downloadURL"].replace("${f}", "asset.bin")
+    return None
+
+
+def download_to(url, path, timeout=300, on_progress=None):
+    with urllib.request.urlopen(url, timeout=timeout) as src, open(path, "wb") as out:
+        total = int(src.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if on_progress:
+                on_progress(done, total, "downloading")
+
+
+def safe_name(title):
+    s = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]", " ", str(title))
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    return s or "wallpaper"
+
+
+def unique_path(directory, base, ext):
+    path = os.path.join(directory, "%s.%s" % (base, ext))
+    n = 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(directory, "%s (%d).%s" % (base, n, ext))
+    return path
+
+
+def fetch_thumbnail(uuid):
+    """Returns (path, created)."""
+    path = os.path.join(THUMB_DIR, uuid + ".jpg")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path, False
+    url = asset_url(cloudkit_lookup(uuid), "videoScreenshotImage")
+    if not url:
+        return None, False
+    tmp = path + ".part"
+    download_to(url, tmp, timeout=60)
+    os.replace(tmp, path)
+    return path, True
+
+
+_DL_LOCKS = {}
+_DL_LOCKS_GUARD = threading.Lock()
+
+
+def fetch_video(uuid):
+    """Fetch + decrypt a wallpaper; returns (path, title, cached)."""
+    with _DL_LOCKS_GUARD:
+        lock = _DL_LOCKS.setdefault(uuid, threading.Lock())
+    with lock:
+        fields = cloudkit_lookup(uuid)
+        title = str(field(fields, "tagsStr") or uuid).strip()
+        base = safe_name(title)
+        ext = str(field(fields, "videoExtension") or "mp4").lower()
+        aes = field(fields, "correctAES", 0)
+        aes = int(aes) == 1 if isinstance(aes, (int, float)) else False
+        want_md5 = str(field(fields, "videoMd5") or "")
+        url = asset_url(fields, "videoData")
+        if not url:
+            raise RuntimeError("record has no videoData URL")
+
+        root = ensure_download_root()
+        first = os.path.join(root, "%s.%s" % (base, ext))
+        if os.path.exists(first):
+            return first, title, True
+
+        target = unique_path(root, base, ext)
+        tmp_asset = target + ".part"
+        set_progress("iw", uuid, 0, None, "downloading")
+        try:
+            download_to(url, tmp_asset,
+                        on_progress=lambda d, t, ph:
+                            set_progress("iw", uuid, d, t, ph))
+            if aes:
+                set_progress("iw", uuid, None, None, "decrypting")
+                rc = subprocess.run([DECRYPT_SH, tmp_asset, target],
+                                    capture_output=True).returncode
+                os.remove(tmp_asset)
+                if rc != 0:
+                    raise RuntimeError("decrypt failed (exit %d)" % rc)
+            else:
+                os.replace(tmp_asset, target)
+        except Exception:
+            if os.path.exists(tmp_asset):
+                os.remove(tmp_asset)
+            raise
+
+        if want_md5:
+            with open(target, "rb") as fh:
+                got = hashlib.md5(fh.read()).hexdigest()
+            if got != want_md5:
+                print("warning: md5 mismatch for %s (got %s, want %s)"
+                      % (uuid, got, want_md5), file=sys.stderr)
+        set_progress("iw", uuid, None, None, "done")
+        return target, title, False
+
+
+# ------------------------------------------------------------------ page ----
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iWallpaper library</title>
+<style>
+  :root { --bg:#0f0f12; --card:#1a1a1f; --line:#2a2a31; --txt:#e8e8ea; --dim:#9a9aa2; --yellow:#ffd400; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:14px/1.4 -apple-system, "SF Pro Text", system-ui, sans-serif; }
+  header { position:sticky; top:0; z-index:10; display:flex; gap:12px; align-items:center;
+           padding:12px 16px; background:rgba(15,15,18,.92); backdrop-filter:blur(8px);
+           border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; font-weight:600; white-space:nowrap; }
+  #q { flex:1; max-width:520px; padding:8px 12px; border-radius:8px; border:1px solid var(--line);
+       background:#000; color:var(--txt); outline:none; }
+  #q:focus { border-color:var(--yellow); }
+  .hidden { display:none; }
+  #morebar { display:flex; justify-content:center; padding:18px 0 40px;
+             color:var(--dim); font-size:12px; min-height:20px; }
+  #count { color:var(--dim); font-size:12px; white-space:nowrap; }
+  #src { display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  #src button { border:0; background:transparent; color:var(--dim); padding:7px 12px;
+                font:600 12px/1 -apple-system, "SF Pro Text", system-ui, sans-serif;
+                cursor:pointer; white-space:nowrap; }
+  #src button.on { background:var(--yellow); color:#111; }
+  #src button:not(.on):hover { color:var(--txt); }
+  #settings { margin-left:auto; width:34px; height:34px; border-radius:50%;
+              border:1px solid var(--line); background:#000; color:var(--dim);
+              display:flex; align-items:center; justify-content:center;
+              cursor:pointer; flex:none; }
+  #settings:hover { color:var(--txt); border-color:var(--yellow); }
+  #settings svg { width:17px; height:17px; }
+  #rating { background:#000; color:var(--txt); border:1px solid var(--line);
+            border-radius:8px; padding:7px 8px; outline:none;
+            font:600 12px/1 -apple-system, "SF Pro Text", system-ui, sans-serif; }
+  #rating:focus { border-color:var(--yellow); }
+  main { padding:16px; }
+  #grid { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:0;
+          border-top:1px solid var(--line); border-left:1px solid var(--line); }
+  @media (max-width: 760px) { #grid { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+  .card { position:relative; overflow:hidden; background:var(--card);
+          cursor:zoom-in; aspect-ratio:16/9;
+          border-right:1px solid var(--line); border-bottom:1px solid var(--line); }
+  .card img { width:100%; height:100%; object-fit:cover; display:block; background:#000; }
+  .card .meta { position:absolute; left:0; right:0; bottom:0; padding:22px 10px 8px; z-index:2;
+                background:linear-gradient(transparent, rgba(0,0,0,.85));
+                display:flex; flex-direction:column; gap:1px; pointer-events:none; }
+  .card .t { font-size:12.5px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .card .s { font-size:11px; color:var(--dim); }
+  .cover { position:absolute; inset:0; z-index:4; display:flex; align-items:center;
+           justify-content:center; flex-direction:column; gap:6px;
+           opacity:0; pointer-events:none;
+           transition:opacity .12s, background .12s; }
+  .cover span { display:none; }
+  .cover span.pct { display:block;
+                    font:600 12px/1.2 -apple-system, "SF Pro Text", system-ui, sans-serif; }
+  .cover span.pct:empty { display:none; }
+  .cover svg { width:42px; height:42px; }
+  .card:not(.downloaded):not(.busy):not(.err):hover .cover,
+  .card.busy .cover,
+  .card.downloaded .cover,
+  .card.err .cover { opacity:1; pointer-events:auto; }
+  .card:not(.downloaded):not(.busy):not(.err):hover .cover,
+  .card.busy .cover { background:var(--yellow); color:#111; }
+  .card:not(.downloaded):not(.busy):not(.err):hover .cover span.dl { display:block; }
+  .card.busy .cover span.spin { display:block; }
+  .card.downloaded .cover { background:#2ecc71; color:#06270f; cursor:pointer; }
+  .card.downloaded .cover span.ok { display:block; }
+  .card.downloaded:hover .cover { background:#3b82f6; color:#fff; }
+  .card.downloaded:hover .cover span.ok { display:none; }
+  .card.downloaded:hover .cover span.folder { display:block; }
+  .card.err .cover { background:#e5484d; color:#fff; }
+  .card.err .cover span.err { display:block; }
+  .cover .ring { width:36px; height:36px; border-radius:50%;
+                 border:4px solid rgba(0,0,0,.18); border-top-color:#111;
+                 animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .card.broken img { visibility:hidden; }
+  .card.broken::after { content:"no thumbnail"; position:absolute; inset:0; display:flex;
+                        align-items:center; justify-content:center; color:var(--dim); font-size:12px; }
+  #lb { position:fixed; inset:0; z-index:50; background:rgba(0,0,0,.88);
+        display:flex; align-items:center; justify-content:center; }
+  #lb.hidden { display:none; }
+  #lb img { max-width:92vw; max-height:88vh; border-radius:8px; box-shadow:0 10px 60px rgba(0,0,0,.7); }
+  #lbclose { position:absolute; top:18px; right:22px; width:46px; height:46px; border-radius:50%;
+             border:0; background:rgba(255,255,255,.12); color:#fff; font-size:26px; cursor:pointer; }
+  #lbclose:hover { background:rgba(255,255,255,.25); }
+  #cfg { position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.75);
+         display:flex; align-items:center; justify-content:center; }
+  #cfg.hidden { display:none; }
+  #cfg .sheet { width:min(560px, 92vw); background:var(--card);
+                border:1px solid var(--line); border-radius:12px;
+                padding:18px 20px; display:flex; flex-direction:column; gap:10px; }
+  #cfg h2 { margin:0; font-size:15px; }
+  #cfg input { width:100%; padding:10px 12px; border-radius:8px;
+               border:1px solid var(--line); background:#000; color:var(--txt);
+               outline:none; font-size:13px; }
+  #cfg input:focus { border-color:var(--yellow); }
+  #cfg .hint { margin:0; color:var(--dim); font-size:11.5px; word-break:break-all; }
+  #cfg .row { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
+  #cfg button { border:1px solid var(--line); background:transparent; color:var(--txt);
+                padding:8px 14px; border-radius:8px; font-size:12px; font-weight:600;
+                cursor:pointer; }
+  #cfg button.primary { background:var(--yellow); color:#111; border-color:var(--yellow); }
+</style>
+</head>
+<body>
+<header>
+  <h1>iWallpaper library</h1>
+  <div id="src">
+    <button data-src="iw" class="on">iWallpaper</button>
+    <button data-src="we">Wallpaper Engine</button>
+  </div>
+  <select id="rating" class="hidden" title="Workshop content rating">
+    <option>Everyone</option>
+    <option>Questionable</option>
+    <option>Mature</option>
+    <option>All</option>
+  </select>
+  <input id="q" type="search" placeholder='Search — commas mean AND: "anime, girls, raiden"' autocomplete="off">
+  <span id="count"></span>
+  <button id="settings" title="Download folder">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>
+  </button>
+</header>
+<main><div id="grid"></div></main>
+<footer id="morebar" class="hidden"><span id="morelabel"></span></footer>
+<div id="lb" class="hidden">
+  <button id="lbclose" title="Close">&times;</button>
+  <img id="lbimg" alt="">
+</div>
+<div id="cfg" class="hidden">
+  <div class="sheet">
+    <h2>Download folder</h2>
+    <input id="dlroot" type="text" spellcheck="false" autocomplete="off">
+    <p class="hint" id="dlhint"></p>
+    <div class="row">
+      <button id="dlcancel">Cancel</button>
+      <button id="dlsave" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+<script>
+const grid = document.getElementById('grid');
+const countEl = document.getElementById('count');
+const q = document.getElementById('q');
+const lb = document.getElementById('lb');
+const lbimg = document.getElementById('lbimg');
+const cfg = document.getElementById('cfg');
+const dlroot = document.getElementById('dlroot');
+const dlhint = document.getElementById('dlhint');
+const settingsBtn = document.getElementById('settings');
+const moreBar = document.getElementById('morebar');
+const moreLabel = document.getElementById('morelabel');
+const ratingEl = document.getElementById('rating');
+let records = [];
+let source = 'iw';
+let weExhausted = false;
+let weLoading = false;
+let weInitialLoading = false;
+let filterBurst = 0;            // consecutive auto-batches while searching
+const FILTER_BURST_MAX = 5;     // then wait for another scroll/wheel gesture
+const srcBtns = document.querySelectorAll('#src button');
+
+const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>';
+const CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>';
+const CROSS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>';
+const FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+const SPIN = '<span class="spin"></span>';
+
+// Load thumbnails near the viewport; drop the src of images that scroll far
+// away so the browser releases their memory (they reload from cache on return).
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    const img = e.target;
+    if (e.isIntersecting) {
+      if (!img.getAttribute('src')) img.src = img.dataset.src;
+    } else if (img.getAttribute('src')) {
+      img.removeAttribute('src');
+    }
+  }
+}, { rootMargin: '1500px 0px' });
+
+// Infinite scroll for the Wallpaper Engine source: when the sentinel at the
+// bottom of the grid approaches the viewport, fetch the next batch of pages.
+const moreIO = new IntersectionObserver(
+  entries => { if (entries.some(e => e.isIntersecting)) maybeLoadMore(); },
+  { rootMargin: '900px 0px' });
+moreIO.observe(moreBar);
+
+srcBtns.forEach(b => b.addEventListener('click', () => setSource(b.dataset.src)));
+ratingEl.addEventListener('change', () => {
+  if (source !== 'we') return;
+  weExhausted = false;
+  weLoading = false;
+  filterBurst = 0;
+  load('we');
+});
+q.addEventListener('input', () => { filterBurst = 0; render(); });
+
+function gesture() {
+  if (source !== 'we') return;
+  filterBurst = 0;
+  if (q.value.trim() && nearBottom()) maybeLoadMore();
+}
+window.addEventListener('scroll', gesture, { passive: true });
+window.addEventListener('wheel', gesture, { passive: true });
+
+async function load(src) {
+  weInitialLoading = true;
+  countEl.textContent = 'loading…';
+  grid.textContent = '';
+  try {
+    const url = src === 'we'
+      ? '/api/we/records?rating=' + encodeURIComponent(ratingEl.value)
+      : '/api/records';
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    records = data;
+    render();
+  } catch (err) {
+    records = [];
+    countEl.textContent = 'failed: ' + err.message;
+  }
+  weInitialLoading = false;
+  updateMore();
+}
+
+function setSource(src) {
+  source = src;
+  weExhausted = false;
+  weLoading = false;
+  filterBurst = 0;
+  ratingEl.classList.toggle('hidden', src !== 'we');
+  srcBtns.forEach(b => b.classList.toggle('on', b.dataset.src === src));
+  q.value = '';
+  load(src);
+}
+
+function updateMore() {
+  const show = source === 'we' && !weExhausted && records.length > 0;
+  moreBar.classList.toggle('hidden', !show);
+  moreLabel.textContent = weLoading ? 'Loading more…' : '';
+}
+
+function nearBottom() {
+  return moreBar.getBoundingClientRect().top < window.innerHeight + 900;
+}
+
+function maybeLoadMore() {
+  if (source !== 'we' || weExhausted || weLoading || weInitialLoading) return;
+  if (q.value.trim() && filterBurst >= FILTER_BURST_MAX) return;
+  loadMore();
+}
+
+async function loadMore() {
+  if (weLoading || source !== 'we' || weExhausted) return;
+  weLoading = true;
+  updateMore();
+  try {
+    const res = await fetch('/api/we/more?rating=' + encodeURIComponent(ratingEl.value));
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || ('HTTP ' + res.status));
+    records = j.reset ? j.items : records.concat(j.items);
+    weExhausted = !!j.exhausted;
+    filterBurst = q.value.trim() ? filterBurst + 1 : 0;
+    render();
+  } catch (err) {
+    console.warn('auto load failed:', err);
+    weLoading = false;
+    moreLabel.textContent = 'Load failed — retrying…';
+    setTimeout(maybeLoadMore, 5000);
+    return;
+  }
+  weLoading = false;
+  updateMore();
+  if (!weExhausted && nearBottom()) setTimeout(maybeLoadMore, 250);
+}
+
+load('iw');
+
+const norm = s => String(s).normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+function parseQuery() {
+  return q.value.split(',')
+    .map(s => norm(s.trim()).replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
+function render() {
+  const terms = parseQuery();
+  grid.textContent = '';
+  let shown = 0;
+  for (const r of records) {
+    if (r._hay === undefined) r._hay = norm(r.title + ' ' + (r.tags || ''));
+    if (terms.length && !terms.every(t => r._hay.includes(t))) continue;
+    shown++;
+    grid.appendChild(card(r));
+  }
+  countEl.textContent = shown + ' / ' + records.length;
+}
+
+function card(r) {
+  const el = document.createElement('div');
+  el.className = 'card' + (r.downloaded ? ' downloaded' : '');
+  el.dataset.id = r.id;
+  if (activeDownloads.has((r.api || '') + '/' + r.id)) el.classList.add('busy');
+  el.innerHTML =
+    '<img loading="lazy" alt="">' +
+    '<div class="meta"><span class="t"></span><span class="s"></span></div>' +
+    '<div class="cover">' +
+      '<span class="dl">' + ICON + '</span>' +
+      '<span class="spin"><div class="ring"></div></span>' +
+      '<span class="pct"></span>' +
+      '<span class="ok">' + CHECK + '</span>' +
+      '<span class="folder">' + FOLDER + '</span>' +
+      '<span class="err">' + CROSS + '</span>' +
+    '</div>';
+  const img = el.querySelector('img');
+  img.dataset.src = (r.api || '') + '/thumb/' + r.id;
+  img.alt = r.title;
+  img.addEventListener('click', () => openLightbox(r));
+  img.addEventListener('error', () => el.classList.add('broken'));
+  io.observe(img);
+  el.querySelector('.t').textContent = r.title;
+  el.querySelector('.s').textContent = r.meta;
+  el.querySelector('.cover').addEventListener('click', e => {
+    e.stopPropagation();
+    if (el.classList.contains('busy')) return;
+    if (el.classList.contains('downloaded')) { reveal(r.id, r.api || '', el); return; }
+    download(r.id, el, r.api || '');
+  });
+  return el;
+}
+
+const activeDownloads = new Map();  // key -> {api, id, stopped}
+
+function pctElFor(api, id) {
+  return document.querySelector('.card[data-id="' + id + '"] .pct');
+}
+
+function startProgress(api, id) {
+  const kind = api === '/we' ? 'we' : 'iw';
+  const key = (api || '') + '/' + id;
+  if (activeDownloads.has(key)) return () => {};
+  const state = { api, id, stopped: false };
+  activeDownloads.set(key, state);
+  const tick = async () => {
+    if (state.stopped) return;
+    const pctEl = pctElFor(api, id);
+    if (pctEl) {
+      try {
+        const r = await fetch('/progress/' + kind + '/' + id);
+        if (r.ok) {
+          const p = await r.json();
+          if (p.phase === 'decrypting') pctEl.textContent = 'Decrypting…';
+          else if (p.phase === 'copying')
+            pctEl.textContent = p.pct != null ? 'Copying ' + p.pct + '%' : 'Copying…';
+          else if (p.phase === 'downloading')
+            pctEl.textContent = p.pct != null ? p.pct + '%' : 'Downloading…';
+        }
+      } catch (e) { /* transient */ }
+    }
+    if (!state.stopped) setTimeout(tick, 700);
+  };
+  tick();
+  return () => {
+    state.stopped = true;
+    activeDownloads.delete(key);
+    const el = pctElFor(api, id);
+    if (el) el.textContent = '';
+  };
+}
+
+async function download(id, cardEl, api) {
+  if (cardEl.classList.contains('busy') || cardEl.classList.contains('downloaded')) return;
+  cardEl.classList.remove('err');
+  cardEl.classList.add('busy');
+  const stopPoll = startProgress(api, id);
+  try {
+    const res = await fetch(api + '/download/' + id);
+    const j = await res.json();
+    if (!res.ok || !j.ok) throw new Error(j.error || ('HTTP ' + res.status));
+    const rec = records.find(x => x.id === id && (x.api || '') === api);
+    if (rec) rec.downloaded = true;
+    cardEl.classList.remove('busy');
+    cardEl.classList.add('downloaded');
+  } catch (err) {
+    cardEl.classList.remove('busy');
+    cardEl.classList.add('err');
+    cardEl.title = 'Failed: ' + err;
+    setTimeout(() => cardEl.classList.remove('err'), 2500);
+  } finally {
+    stopPoll();
+  }
+}
+
+async function reveal(id, api, cardEl) {
+  try {
+    const res = await fetch(api + '/reveal/' + id);
+    if (res.ok) return;
+    if (res.status === 404) {
+      // the file was deleted outside the app: make the tile downloadable again
+      cardEl.classList.remove('downloaded');
+      return;
+    }
+    console.warn('reveal failed:', await res.text());
+  } catch (err) {
+    console.warn('reveal failed:', err);
+  }
+}
+
+function openLightbox(r) {
+  lbimg.src = '/thumb/' + r.id;
+  lb.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+}
+function closeLightbox() {
+  lb.classList.add('hidden');
+  lbimg.src = '';
+  document.body.style.overflow = '';
+}
+document.getElementById('lbclose').addEventListener('click', closeLightbox);
+lb.addEventListener('click', e => { if (e.target === lb) closeLightbox(); });
+settingsBtn.addEventListener('click', openSettings);
+document.getElementById('dlcancel').addEventListener('click',
+  () => cfg.classList.add('hidden'));
+document.getElementById('dlsave').addEventListener('click', saveSettings);
+cfg.addEventListener('click', e => { if (e.target === cfg) cfg.classList.add('hidden'); });
+dlroot.addEventListener('keydown', e => { if (e.key === 'Enter') saveSettings(); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (!cfg.classList.contains('hidden')) { cfg.classList.add('hidden'); return; }
+  closeLightbox();
+});
+
+async function openSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    const j = await res.json();
+    dlroot.value = j.download_root || '';
+    dlhint.textContent = 'Default: ' + (j.default_root || '');
+  } catch (err) {
+    dlhint.textContent = 'Could not read settings: ' + err;
+  }
+  cfg.classList.remove('hidden');
+  dlroot.focus();
+  dlroot.select();
+}
+
+async function saveSettings() {
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ download_root: dlroot.value })
+    });
+    let j = {};
+    try { j = await res.json(); } catch (e) { /* ignore */ }
+    if (!res.ok || !j.ok) throw new Error(j.error || ('HTTP ' + res.status));
+    cfg.classList.add('hidden');
+    load(source);
+  } catch (err) {
+    dlhint.textContent = 'Error: ' + err.message;
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------- server -----
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "iWallpaperUI/1.0"
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args), file=sys.stderr)
+
+    def _send(self, code, body, ctype="text/plain", headers=()):
+        if isinstance(body, str):
+            body = body.encode()
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path == "/":
+                self._send(200, PAGE, "text/html; charset=utf-8")
+            elif path == "/api/records":
+                with _INDEX_LOCK:
+                    done = {u for u, f in INDEX.items()
+                            if os.path.exists(f)}
+                payload = json.dumps([
+                    dict(r,
+                         api="",
+                         meta="%s · %s MB · %ss · hot %s"
+                              % (r["res"], r["mb"], r["dur"], r["hot"]),
+                         downloaded=r["id"] in done)
+                    for r in RECORDS])
+                self._send(200, payload, "application/json",
+                           [("Cache-Control", "no-store")])
+            elif path == "/api/we/records":
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                refresh = query.get("refresh", ["0"])[0] == "1"
+                rating = query.get("rating", ["Everyone"])[0]
+                try:
+                    payload = json.dumps(we_records(refresh, rating))
+                except Exception as exc:
+                    self._send(500, json.dumps({"ok": False, "error": str(exc)}),
+                               "application/json")
+                    return
+                self._send(200, payload, "application/json",
+                           [("Cache-Control", "no-store")])
+            elif path == "/api/we/more":
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                rating = query.get("rating", ["Everyone"])[0]
+                try:
+                    payload = json.dumps(we_more(rating=rating))
+                except Exception as exc:
+                    self._send(500, json.dumps({"ok": False, "error": str(exc)}),
+                               "application/json")
+                    return
+                self._send(200, payload, "application/json",
+                           [("Cache-Control", "no-store")])
+            elif path == "/api/settings":
+                self._send(200, json.dumps({
+                    "download_root": DOWNLOAD_ROOT,
+                    "default_root": DEFAULT_DOWNLOAD_ROOT
+                }), "application/json", [("Cache-Control", "no-store")])
+            elif path.startswith("/thumb/"):
+                self._thumb(path[len("/thumb/"):])
+            elif path.startswith("/download/"):
+                self._download(path[len("/download/"):])
+            elif path.startswith("/reveal/"):
+                self._reveal(path[len("/reveal/"):])
+            elif path.startswith("/progress/"):
+                self._progress(path[len("/progress/"):])
+            elif path.startswith("/we/thumb/"):
+                self._we_thumb(path[len("/we/thumb/"):])
+            elif path.startswith("/we/download/"):
+                self._we_download(path[len("/we/download/"):])
+            elif path.startswith("/we/reveal/"):
+                self._we_reveal(path[len("/we/reveal/"):])
+            elif path == "/favicon.ico":
+                self._send(204, b"")
+            elif path == "/health":
+                self._send(200, '{"ok":true}', "application/json")
+            else:
+                self._send(404, "not found")
+        except Exception as exc:
+            self._send(500, json.dumps({"ok": False, "error": str(exc)}),
+                       "application/json")
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/api/settings":
+            self._send(404, "not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            new_root = set_download_root(payload.get("download_root") or "")
+        except ValueError as exc:
+            self._send(400, json.dumps({"ok": False, "error": str(exc)}),
+                       "application/json")
+            return
+        except OSError as exc:
+            self._send(500, json.dumps({"ok": False, "error": str(exc)}),
+                       "application/json")
+            return
+        self._send(200, json.dumps({"ok": True, "download_root": new_root}),
+                   "application/json")
+
+    def _thumb(self, uuid):
+        if not UUID_RE.fullmatch(uuid):
+            self._send(404, "bad record id")
+            return
+        path, created = fetch_thumbnail(uuid)
+        if not path:
+            self._send(404, "no thumbnail")
+            return
+        if created:
+            enforce_cache_cap(THUMB_DIR)
+        with open(path, "rb") as fh:
+            self._send(200, fh.read(), "image/jpeg",
+                       [("Cache-Control", "public, max-age=86400")])
+
+    def _download(self, uuid):
+        if not UUID_RE.fullmatch(uuid):
+            self._send(404, "bad record id")
+            return
+        set_progress("iw", uuid, 0, None, "downloading")
+        try:
+            path, title, cached = fetch_video(uuid)
+        except Exception as exc:
+            set_progress("iw", uuid, None, None, "error")
+            print("iWallpaper download failed %s: %s" % (uuid, exc),
+                  file=sys.stderr)
+            self._send(500, json.dumps({"ok": False, "error": str(exc)}),
+                       "application/json")
+            return
+        set_progress("iw", uuid, None, None, "done")
+        mark_downloaded(uuid, path)
+        self._send(200, json.dumps({"ok": True, "file": os.path.basename(path),
+                                    "title": title, "cached": cached}),
+                   "application/json")
+
+    def _reveal(self, uuid):
+        if not UUID_RE.fullmatch(uuid):
+            self._send(404, json.dumps({"ok": False, "error": "bad record id"}),
+                       "application/json")
+            return
+        with _INDEX_LOCK:
+            fname = INDEX.get(uuid)
+        path = fname if fname and os.path.isabs(fname) else None
+        if not path or not os.path.exists(path):
+            self._send(404, json.dumps({"ok": False, "error": "file not found"}),
+                       "application/json")
+            return
+        subprocess.run(["open", "-R", path], check=False)
+        self._send(200, json.dumps({"ok": True, "file": os.path.basename(path)}),
+                   "application/json")
+
+    # --- Wallpaper Engine ---------------------------------------------------
+
+    def _we_thumb(self, item_id):
+        if not re.fullmatch(r"\d{1,20}", item_id):
+            self._send(404, "bad item id")
+            return
+        rec = we_item(item_id)
+        path, created = we_source.thumbnail(item_id, rec["preview"] if rec else "")
+        if not path:
+            self._send(404, "no thumbnail")
+            return
+        if created:
+            enforce_cache_cap(we_source.THUMB_DIR)
+        with open(path, "rb") as fh:
+            self._send(200, fh.read(), we_source.thumb_type(path),
+                       [("Cache-Control", "public, max-age=604800")])
+
+    def _we_download(self, item_id):
+        if not re.fullmatch(r"\d{1,20}", item_id):
+            self._send(404, "bad item id")
+            return
+        rec = we_item(item_id)
+        title = rec["title"] if rec else item_id
+        expected = int(rec.get("bytes") or 0) if rec else 0
+        if not expected and rec:
+            expected = int((rec.get("mb") or 0) * 1e6)
+        set_progress("we", item_id, 0, None, "downloading")
+        try:
+            path, via, cached = we_source.download(
+                item_id, title, expected_bytes=expected,
+                dest_dir=ensure_download_root(),
+                on_progress=lambda d, t, ph:
+                    set_progress("we", item_id, d, t, ph))
+        except Exception as exc:
+            set_progress("we", item_id, None, None, "error")
+            print("WE download failed %s: %s" % (item_id, exc), file=sys.stderr)
+            self._send(500, json.dumps({"ok": False, "error": str(exc)}),
+                       "application/json")
+            return
+        set_progress("we", item_id, None, None, "done")
+        we_mark_downloaded(item_id, path)
+        self._send(200, json.dumps({"ok": True, "file": os.path.basename(path),
+                                    "via": via, "cached": cached}),
+                   "application/json")
+
+    def _we_reveal(self, item_id):
+        if not re.fullmatch(r"\d{1,20}", item_id):
+            self._send(404, json.dumps({"ok": False, "error": "bad item id"}),
+                       "application/json")
+            return
+        with _WE_INDEX_LOCK:
+            fname = WE_INDEX.get(item_id)
+        path = fname if fname and os.path.isabs(fname) else None
+        if not path or not os.path.exists(path):
+            self._send(404, json.dumps({"ok": False, "error": "file not found"}),
+                       "application/json")
+            return
+        subprocess.run(["open", "-R", path], check=False)
+        self._send(200, json.dumps({"ok": True, "file": os.path.basename(path)}),
+                   "application/json")
+
+    def _progress(self, rest):
+        parts = rest.split("/", 1)
+        if len(parts) != 2:
+            self._send(404, json.dumps({"ok": False}),
+                       "application/json")
+            return
+        kind, item_id = parts
+        if kind not in ("iw", "we") or not re.fullmatch(r"[0-9A-Za-z-]{1,64}",
+                                                        item_id):
+            self._send(404, json.dumps({"ok": False}),
+                       "application/json")
+            return
+        self._send(200, json.dumps(get_progress(kind, item_id)),
+                   "application/json", [("Cache-Control", "no-store")])
+
+
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = "http://127.0.0.1:%d/" % port
+    print("iWallpaper browser: %s" % url)
+    print("thumbnail cache:    %s" % THUMB_DIR)
+    print("downloads:          %s" % DOWNLOAD_ROOT)
+    print("Ctrl-C to stop.")
+    webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

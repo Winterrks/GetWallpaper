@@ -1,0 +1,18 @@
+# local runtime state
+settings.json
+indexes/
+thumbs/
+we_thumbs/
+we_downloads/
+downloads/
+we_catalog*.json
+we_durations.json
+__pycache__/
+*.pyc
+
+# media
+*.mp4
+*.mov
+*.webm
+*.jpg
+.DS_Store
