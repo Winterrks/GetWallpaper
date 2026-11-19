@@ -29,7 +29,7 @@ It runs entirely on your machine: one Python process, a browser tab on
 ### Option A — pip / pipx (recommended)
 
 Download the `.whl` from the
-[latest release](https://github.com/waifucave/GetWallpaper/releases/latest) and:
+[latest release](https://github.com/Winterrks/GetWallpaper/releases/latest) and:
 
 ```bash
 pipx install ./getw-*.whl
@@ -47,7 +47,7 @@ python3 getw.pyz start
 ### Option C — from source
 
 ```bash
-git clone https://github.com/waifucave/GetWallpaper.git
+git clone https://github.com/Winterrks/GetWallpaper.git
 cd GetWallpaper
 python3 -m getw start
 ```
