@@ -51,6 +51,7 @@ CACHE = os.path.join(HERE, "we_catalog.json")
 THUMB_DIR = os.path.join(HERE, "we_thumbs")
 DL_DIR = os.path.join(HERE, "we_downloads")
 CACHE_TTL = 6 * 3600
+_CACHE_MEM = {}
 PAGE_SIZE = 30
 MAX_PAGES = 1000
 FETCH_WORKERS = max(1, min(16, int(os.environ.get("GETW_FETCH_WORKERS", "10"))))  # Steam clamps every Workshop browse query to 1,000 pages
@@ -138,19 +139,32 @@ def _cache_path(rating):
 
 
 def _load_cache(rating="Everyone"):
+    if rating in _CACHE_MEM:
+        return _CACHE_MEM[rating]
     try:
         with open(_cache_path(rating)) as fh:
-            return json.load(fh)
+            data = json.load(fh)
+        _CACHE_MEM[rating] = data
+        return data
     except (OSError, ValueError):
         return None
 
 
-def _save_cache(data, rating="Everyone"):
+def _save_cache(data, rating="Everyone", persist=True):
+    _CACHE_MEM[rating] = data
+    if not persist:
+        return
     try:
         with open(_cache_path(rating), "w") as fh:
             json.dump(data, fh)
     except OSError as exc:
         print("we_source: cache write failed: %s" % exc, file=sys.stderr)
+
+
+def flush_cache(rating="Everyone"):
+    data = _CACHE_MEM.get(rating)
+    if data is not None:
+        _save_cache(data, rating, persist=True)
 
 
 def known_items():
@@ -209,7 +223,7 @@ def catalog(pages=8, refresh=False, rating="Everyone"):
     return items
 
 
-def fetch_more(pages=8, rating="Everyone"):
+def fetch_more(pages=8, rating="Everyone", persist=True):
     """Fetch the next `pages` after the cache; only new items are returned.
 
     Returns (added_items, total_items, exhausted, reset). `reset` is True when
@@ -231,7 +245,7 @@ def fetch_more(pages=8, rating="Everyone"):
     data["items"] = data.get("items", []) + added
     data["pages"] = start - 1 + fetched
     data["fetched_at"] = time.time()
-    _save_cache(data, rating)
+    _save_cache(data, rating, persist=persist)
 
     exhausted = fetched == 0 or (start - 1 + fetched) >= MAX_PAGES
     return added, len(data["items"]), exhausted, False

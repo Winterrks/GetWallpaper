@@ -340,8 +340,7 @@ def we_more(pages=8, rating="Everyone"):
     with _WE_LOCK:
         added, total, exhausted, reset = we_source.fetch_more(pages=pages,
                                                               rating=rating)
-        items = we_source.catalog(rating=rating)
-        WE_ITEMS.update({r["id"]: r for r in items})
+        WE_ITEMS.update({r["id"]: r for r in added})
     return {"items": _we_rows(added), "total": total,
             "exhausted": exhausted, "reset": reset}
 
@@ -389,20 +388,24 @@ def _fill_worker(rating):
         for _ in range(200):
             with _WE_LOCK:
                 added, total, exhausted, reset = we_source.fetch_more(
-                    pages=24, rating=rating)
-                items = we_source.catalog(rating=rating)
-                WE_ITEMS.update({r["id"]: r for r in items})
+                    pages=24, rating=rating, persist=False)
+                WE_ITEMS.update({r["id"]: r for r in added})
             with _FILL_LOCK:
                 _FILL.setdefault(rating, {}).update(
                     total=total, exhausted=exhausted, error=None)
             if exhausted:
                 break
             zero = zero + 1 if not added else 0
-            time.sleep(5 if zero >= 3 else 0.4)
+            _n = globals().get("_FILL_N", 0) + 1
+            globals()["_FILL_N"] = _n
+            if _n % 10 == 0:
+                we_source.flush_cache(rating)
+            time.sleep(5 if zero >= 3 else 1.0)
     except Exception as exc:
         with _FILL_LOCK:
             _FILL.setdefault(rating, {}).update(error=str(exc))
     finally:
+        we_source.flush_cache(rating)
         with _FILL_LOCK:
             _FILL.setdefault(rating, {})["running"] = False
 
