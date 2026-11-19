@@ -28,12 +28,12 @@ It runs entirely on your machine: one Python process, a browser tab on
 
 ### Option A — pip / pipx (recommended)
 
-Download `getw-0.1.0-py3-none-any.whl` from the
+Download the `.whl` from the
 [latest release](https://github.com/waifucave/GetWallapper/releases/latest) and:
 
 ```bash
-pipx install ./getw-0.1.0-py3-none-any.whl
-# or: python3 -m pip install --user ./getw-0.1.0-py3-none-any.whl
+pipx install ./getw-*.whl
+# or: python3 -m pip install --user ./getw-*.whl
 ```
 
 ### Option B — no install (zipapp)

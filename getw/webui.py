@@ -189,6 +189,15 @@ def get_progress(kind, item_id):
     cur["pct"] = round(done * 100 / total) if total else None
     return cur
 
+
+def is_downloading(kind, item_id):
+    with _PROGRESS_LOCK:
+        cur = _PROGRESS.get((kind, item_id))
+        if not cur:
+            return False
+        return (cur.get("phase") in ("downloading", "copying", "decrypting")
+                and time.time() - cur.get("ts", 0) < 3600)
+
 DL_INDEX = os.path.join(INDEX_DIR, "iw.json")
 _INDEX_LOCK = threading.Lock()
 
@@ -305,7 +314,8 @@ def _we_rows(items):
              "meta": "%s · %.1f MB · %s subs" % (r["res"], r["mb"], r["subs"]),
              "tags": " ".join(r.get("tags", [])),
              "api": "/we",
-             "downloaded": r["id"] in done} for r in items]
+             "downloaded": r["id"] in done,
+             "downloading": is_downloading("we", r["id"])} for r in items]
 
 
 def we_records(refresh=False, rating="Everyone"):
@@ -669,6 +679,10 @@ let weLoading = false;
 let weInitialLoading = false;
 let filterBurst = 0;            // consecutive auto-batches while searching
 const FILTER_BURST_MAX = 5;     // then wait for another scroll/wheel gesture
+let searchTimer = null;
+const CHUNK = 120;              // cards rendered per batch
+let filtered = [];
+let visibleCount = 0;
 const srcBtns = document.querySelectorAll('#src button');
 
 const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>';
@@ -705,15 +719,27 @@ ratingEl.addEventListener('change', () => {
   filterBurst = 0;
   load('we');
 });
-q.addEventListener('input', () => { filterBurst = 0; render(); });
-
-function gesture() {
-  if (source !== 'we') return;
+q.addEventListener('input', () => {
   filterBurst = 0;
-  if (q.value.trim() && nearBottom()) maybeLoadMore();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(rebuildGrid, 150);
+});
+
+let growScheduled = false;
+function onScroll() {
+  if (growScheduled) return;
+  growScheduled = true;
+  requestAnimationFrame(() => {
+    growScheduled = false;
+    if (!nearPageBottom()) return;
+    filterBurst = 0;
+    if (!growGrid()) maybeLoadMore();
+  });
 }
-window.addEventListener('scroll', gesture, { passive: true });
-window.addEventListener('wheel', gesture, { passive: true });
+window.addEventListener('scroll', onScroll, { passive: true });
+window.addEventListener('wheel', () => {
+  if (source === 'we') filterBurst = 0;
+}, { passive: true });
 
 async function load(src) {
   weInitialLoading = true;
@@ -759,6 +785,7 @@ function nearBottom() {
 
 function maybeLoadMore() {
   if (source !== 'we' || weExhausted || weLoading || weInitialLoading) return;
+  if (visibleCount < filtered.length) return;   // still have local cards to show
   if (q.value.trim() && filterBurst >= FILTER_BURST_MAX) return;
   loadMore();
 }
@@ -774,7 +801,8 @@ async function loadMore() {
     records = j.reset ? j.items : records.concat(j.items);
     weExhausted = !!j.exhausted;
     filterBurst = q.value.trim() ? filterBurst + 1 : 0;
-    render();
+    computeFiltered();
+    if (nearPageBottom()) growGrid();
   } catch (err) {
     console.warn('auto load failed:', err);
     weLoading = false;
@@ -799,16 +827,44 @@ function parseQuery() {
 }
 
 function render() {
+  rebuildGrid();
+}
+
+function computeFiltered() {
   const terms = parseQuery();
-  grid.textContent = '';
-  let shown = 0;
+  filtered = [];
   for (const r of records) {
     if (r._hay === undefined) r._hay = norm(r.title + ' ' + (r.tags || ''));
-    if (terms.length && !terms.every(t => r._hay.includes(t))) continue;
-    shown++;
-    grid.appendChild(card(r));
+    if (!terms.length || terms.every(t => r._hay.includes(t))) filtered.push(r);
   }
-  countEl.textContent = shown + ' / ' + records.length;
+  countEl.textContent = filtered.length + ' / ' + records.length;
+}
+
+function appendRange(from, to) {
+  const frag = document.createDocumentFragment();
+  for (let i = from; i < to; i++) frag.appendChild(card(filtered[i]));
+  grid.appendChild(frag);
+}
+
+function rebuildGrid() {
+  computeFiltered();
+  visibleCount = Math.min(CHUNK, filtered.length);
+  grid.textContent = '';
+  appendRange(0, visibleCount);
+  updateMore();
+}
+
+function growGrid() {
+  if (visibleCount >= filtered.length) return false;
+  const to = Math.min(visibleCount + CHUNK, filtered.length);
+  appendRange(visibleCount, to);
+  visibleCount = to;
+  return true;
+}
+
+function nearPageBottom() {
+  return window.innerHeight + window.scrollY >=
+         document.documentElement.scrollHeight - 1400;
 }
 
 function card(r) {
@@ -816,6 +872,10 @@ function card(r) {
   el.className = 'card' + (r.downloaded ? ' downloaded' : '');
   el.dataset.id = r.id;
   if (activeDownloads.has((r.api || '') + '/' + r.id)) el.classList.add('busy');
+  if (r.downloading && !r.downloaded) {
+    el.classList.add('busy');
+    startProgress(r.api || '', r.id);
+  }
   el.innerHTML =
     '<img loading="lazy" alt="">' +
     '<div class="meta"><span class="t"></span><span class="s"></span></div>' +
@@ -850,12 +910,34 @@ function pctElFor(api, id) {
   return document.querySelector('.card[data-id="' + id + '"] .pct');
 }
 
+function cardElFor(api, id) {
+  return document.querySelector('.card[data-id="' + id + '"]');
+}
+
 function startProgress(api, id) {
   const kind = api === '/we' ? 'we' : 'iw';
   const key = (api || '') + '/' + id;
   if (activeDownloads.has(key)) return () => {};
   const state = { api, id, stopped: false };
   activeDownloads.set(key, state);
+
+  function finish(good) {
+    state.stopped = true;
+    activeDownloads.delete(key);
+    const el = cardElFor(api, id);
+    if (!el) return;
+    const pct = el.querySelector('.pct');
+    if (pct) pct.textContent = '';
+    if (good === true) {
+      el.classList.remove('busy', 'err');
+      el.classList.add('downloaded');
+    } else if (good === false) {
+      el.classList.remove('busy');
+      el.classList.add('err');
+      setTimeout(() => el.classList.remove('err'), 2500);
+    }
+  }
+
   const tick = async () => {
     if (state.stopped) return;
     const pctEl = pctElFor(api, id);
@@ -864,6 +946,13 @@ function startProgress(api, id) {
         const r = await fetch('/progress/' + kind + '/' + id);
         if (r.ok) {
           const p = await r.json();
+          if (p.phase === 'done') {
+            const rec = records.find(x => x.id === id && (x.api || '') === api);
+            if (rec) rec.downloaded = true;
+            finish(true);
+            return;
+          }
+          if (p.phase === 'error') { finish(false); return; }
           if (p.phase === 'decrypting') pctEl.textContent = 'Decrypting…';
           else if (p.phase === 'copying')
             pctEl.textContent = p.pct != null ? 'Copying ' + p.pct + '%' : 'Copying…';
@@ -875,12 +964,7 @@ function startProgress(api, id) {
     if (!state.stopped) setTimeout(tick, 700);
   };
   tick();
-  return () => {
-    state.stopped = true;
-    activeDownloads.delete(key);
-    const el = pctElFor(api, id);
-    if (el) el.textContent = '';
-  };
+  return () => finish(undefined);
 }
 
 async function download(id, cardEl, api) {
@@ -1018,7 +1102,8 @@ class Handler(BaseHTTPRequestHandler):
                          api="",
                          meta="%s · %s MB · %ss · hot %s"
                               % (r["res"], r["mb"], r["dur"], r["hot"]),
-                         downloaded=r["id"] in done)
+                         downloaded=r["id"] in done,
+                         downloading=is_downloading("iw", r["id"]))
                     for r in RECORDS])
                 self._send(200, payload, "application/json",
                            [("Cache-Control", "no-store")])
