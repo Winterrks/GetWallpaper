@@ -94,6 +94,9 @@ def _load_settings():
 SETTINGS = _load_settings()
 DOWNLOAD_ROOT = os.path.abspath(os.path.expanduser(
     SETTINGS.get("download_root") or DEFAULT_DOWNLOAD_ROOT))
+THUMB_CAP_MB = max(64, int(SETTINGS.get("thumb_cap_mb") or 1024))
+THUMB_CAP = THUMB_CAP_MB * 1024 * 1024
+PREFILL_ENABLED = bool(SETTINGS.get("prefill_thumbs"))
 
 
 def ensure_download_root():
@@ -112,18 +115,145 @@ def set_download_root(path):
     os.remove(probe)
     DOWNLOAD_ROOT = path
     SETTINGS["download_root"] = path
+    _save_settings()
+    return path
+
+
+def _save_settings():
     tmp = SETTINGS_PATH + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(SETTINGS, fh, indent=1)
     os.replace(tmp, SETTINGS_PATH)
-    return path
 
+
+def _dir_stats(path):
+    total = count = 0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_file():
+                        count += 1
+                        total += entry.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return {"mb": round(total / 1e6, 1), "count": count}
+
+
+PF = {"running": False, "done": 0, "total": 0, "source": "", "error": None}
+_PF_LOCK = threading.Lock()
+
+
+def _pf_set(**kw):
+    with _PF_LOCK:
+        PF.update(kw)
+
+
+def _pf_active():
+    return PF.get("running") and SETTINGS.get("prefill_thumbs")
+
+
+def start_prefill():
+    with _PF_LOCK:
+        if PF.get("running"):
+            return dict(PF)
+        PF.update(running=True, done=0, total=0, source="iWallpaper",
+                  error=None)
+    threading.Thread(target=_prefill_worker, daemon=True).start()
+    return dict(PF)
+
+
+def stop_prefill():
+    _pf_set(running=False)
+
+
+def _prefill_worker():
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_iw(rec):
+        try:
+            fetch_thumbnail(rec["id"])
+        except Exception:
+            pass
+
+    def fetch_we(rec):
+        try:
+            we_source.thumbnail(rec["id"], rec["preview"])
+        except Exception:
+            pass
+
+    try:
+        _pf_set(source="iWallpaper", total=len(RECORDS), done=0)
+        for i in range(0, len(RECORDS), 16):
+            if not _pf_active():
+                return
+            if _dir_stats(THUMB_DIR)["mb"] * 1e6 >= THUMB_CAP:
+                break
+            batch = RECORDS[i:i + 16]
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(fetch_iw, batch))
+            _pf_set(done=min(len(RECORDS), PF.get("done", 0) + len(batch)))
+
+        items = we_source.catalog(rating="Everyone")
+        _pf_set(source="Wallpaper Engine", total=len(items), done=0)
+        for i in range(0, len(items), 16):
+            if not _pf_active():
+                return
+            if _dir_stats(we_source.THUMB_DIR)["mb"] * 1e6 >= THUMB_CAP:
+                break
+            batch = items[i:i + 16]
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(fetch_we, batch))
+            _pf_set(done=min(len(items), PF.get("done", 0) + len(batch)))
+    except Exception as exc:
+        _pf_set(error=str(exc))
+    finally:
+        _pf_set(running=False)
+
+
+def settings_payload():
+    return {
+        "download_root": DOWNLOAD_ROOT,
+        "default_root": DEFAULT_DOWNLOAD_ROOT,
+        "thumb_cap_mb": THUMB_CAP_MB,
+        "prefill_thumbs": bool(SETTINGS.get("prefill_thumbs")),
+        "thumb_cache": {
+            "iw": _dir_stats(THUMB_DIR),
+            "we": _dir_stats(we_source.THUMB_DIR),
+        },
+        "prefill": dict(PF),
+    }
+
+
+def update_settings(payload):
+    global THUMB_CAP, THUMB_CAP_MB
+    if payload.get("download_root"):
+        set_download_root(payload["download_root"])
+    if payload.get("thumb_cap_mb") is not None:
+        mb = int(payload["thumb_cap_mb"])
+        if mb < 64:
+            raise ValueError("cache size must be at least 64 MB")
+        THUMB_CAP_MB = mb
+        THUMB_CAP = mb * 1024 * 1024
+        SETTINGS["thumb_cap_mb"] = mb
+        enforce_cache_cap(THUMB_DIR, THUMB_CAP)
+        enforce_cache_cap(we_source.THUMB_DIR, THUMB_CAP)
+    if payload.get("prefill_thumbs") is not None:
+        enabled = bool(payload["prefill_thumbs"])
+        SETTINGS["prefill_thumbs"] = enabled
+        if enabled:
+            start_prefill()
+        else:
+            stop_prefill()
+    _save_settings()
+    return settings_payload()
 
 os.makedirs(THUMB_DIR, exist_ok=True)
 os.makedirs(INDEX_DIR, exist_ok=True)
 ensure_download_root()
 
-THUMB_CAP = int(os.environ.get("THUMB_CAP_BYTES", 1 << 30))  # 1 GiB per cache
 _CACHE_LOCK = threading.Lock()
 
 
@@ -683,10 +813,15 @@ PAGE = r"""<!doctype html>
                 border:1px solid var(--line); border-radius:12px;
                 padding:18px 20px; display:flex; flex-direction:column; gap:10px; }
   #cfg h2 { margin:0; font-size:15px; }
-  #cfg input { width:100%; padding:10px 12px; border-radius:8px;
-               border:1px solid var(--line); background:#000; color:var(--txt);
-               outline:none; font-size:13px; }
+  #cfg input[type=text], #cfg input[type=number] { width:100%; padding:10px 12px;
+               border-radius:8px; border:1px solid var(--line); background:#000;
+               color:var(--txt); outline:none; font-size:13px; }
   #cfg input:focus { border-color:var(--yellow); }
+  #cfg .field { display:flex; flex-direction:column; gap:5px;
+                color:var(--dim); font-size:11.5px; }
+  #cfg .check { display:flex; align-items:center; gap:8px; color:var(--txt);
+                font-size:12.5px; }
+  #cfg .check input { accent-color: var(--yellow); }
   #cfg .hint { margin:0; color:var(--dim); font-size:11.5px; word-break:break-all; }
   #cfg .row { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
   #cfg button { border:1px solid var(--line); background:transparent; color:var(--txt);
@@ -722,9 +857,16 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="cfg" class="hidden">
   <div class="sheet">
-    <h2>Download folder</h2>
-    <input id="dlroot" type="text" spellcheck="false" autocomplete="off">
+    <h2>Settings</h2>
+    <label class="field"><span>Download folder</span>
+      <input id="dlroot" type="text" spellcheck="false" autocomplete="off"></label>
     <p class="hint" id="dlhint"></p>
+    <label class="field"><span>Thumbnail cache limit (MB)</span>
+      <input id="dlcap" type="number" min="64" step="64" value="1024"></label>
+    <label class="check"><input id="dlprefill" type="checkbox">
+      Prefill thumbnails (fills the cache automatically)</label>
+    <p class="hint" id="dlcache"></p>
+    <p class="hint" id="dlpf"></p>
     <div class="row">
       <button id="dlcancel">Cancel</button>
       <button id="dlsave" class="primary">Save</button>
@@ -739,7 +881,12 @@ const lb = document.getElementById('lb');
 const lbimg = document.getElementById('lbimg');
 const cfg = document.getElementById('cfg');
 const dlroot = document.getElementById('dlroot');
+const dlcap = document.getElementById('dlcap');
+const dlprefill = document.getElementById('dlprefill');
 const dlhint = document.getElementById('dlhint');
+const dlcache = document.getElementById('dlcache');
+const dlpf = document.getElementById('dlpf');
+let cfgTimer = null;
 const settingsBtn = document.getElementById('settings');
 const moreBar = document.getElementById('morebar');
 const moreLabel = document.getElementById('morelabel');
@@ -1184,29 +1331,55 @@ function closeLightbox() {
 document.getElementById('lbclose').addEventListener('click', closeLightbox);
 lb.addEventListener('click', e => { if (e.target === lb) closeLightbox(); });
 settingsBtn.addEventListener('click', openSettings);
-document.getElementById('dlcancel').addEventListener('click',
-  () => cfg.classList.add('hidden'));
+document.getElementById('dlcancel').addEventListener('click', closeSettings);
 document.getElementById('dlsave').addEventListener('click', saveSettings);
-cfg.addEventListener('click', e => { if (e.target === cfg) cfg.classList.add('hidden'); });
+cfg.addEventListener('click', e => { if (e.target === cfg) closeSettings(); });
 dlroot.addEventListener('keydown', e => { if (e.key === 'Enter') saveSettings(); });
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
-  if (!cfg.classList.contains('hidden')) { cfg.classList.add('hidden'); return; }
+  if (!cfg.classList.contains('hidden')) { closeSettings(); return; }
   closeLightbox();
 });
+
+function closeSettings() {
+  cfg.classList.add('hidden');
+  if (cfgTimer) { clearInterval(cfgTimer); cfgTimer = null; }
+}
+
+function updateCacheLines(j) {
+  const c = j.thumb_cache || { iw: { mb: 0, count: 0 }, we: { mb: 0, count: 0 } };
+  dlcache.textContent = 'Cache used: iWallpaper ' + c.iw.mb + ' MB (' +
+    c.iw.count + ' files) · Workshop ' + c.we.mb + ' MB (' + c.we.count +
+    ' files) — limit ' + j.thumb_cap_mb + ' MB per source';
+  const p = j.prefill || {};
+  dlpf.textContent = p.running
+    ? 'Prefilling ' + p.source + '… ' + (p.done || 0).toLocaleString() +
+      ' / ' + (p.total || 0).toLocaleString()
+    : (p.error ? 'Prefill error: ' + p.error : '');
+}
 
 async function openSettings() {
   try {
     const res = await fetch('/api/settings');
     const j = await res.json();
     dlroot.value = j.download_root || '';
+    dlcap.value = j.thumb_cap_mb || 1024;
+    dlprefill.checked = !!j.prefill_thumbs;
     dlhint.textContent = 'Default: ' + (j.default_root || '');
+    updateCacheLines(j);
   } catch (err) {
     dlhint.textContent = 'Could not read settings: ' + err;
   }
   cfg.classList.remove('hidden');
   dlroot.focus();
   dlroot.select();
+  if (cfgTimer) clearInterval(cfgTimer);
+  cfgTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/api/settings');
+      if (r.ok) updateCacheLines(await r.json());
+    } catch (e) { /* ignore */ }
+  }, 1200);
 }
 
 async function saveSettings() {
@@ -1214,12 +1387,16 @@ async function saveSettings() {
     const res = await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ download_root: dlroot.value })
+      body: JSON.stringify({
+        download_root: dlroot.value,
+        thumb_cap_mb: parseInt(dlcap.value, 10) || 1024,
+        prefill_thumbs: dlprefill.checked
+      })
     });
     let j = {};
     try { j = await res.json(); } catch (e) { /* ignore */ }
     if (!res.ok || !j.ok) throw new Error(j.error || ('HTTP ' + res.status));
-    cfg.classList.add('hidden');
+    closeSettings();
     load(source);
   } catch (err) {
     dlhint.textContent = 'Error: ' + err.message;
@@ -1313,10 +1490,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(fill_status(rating)),
                            "application/json", [("Cache-Control", "no-store")])
             elif path == "/api/settings":
-                self._send(200, json.dumps({
-                    "download_root": DOWNLOAD_ROOT,
-                    "default_root": DEFAULT_DOWNLOAD_ROOT
-                }), "application/json", [("Cache-Control", "no-store")])
+                self._send(200, json.dumps(settings_payload()),
+                           "application/json",
+                           [("Cache-Control", "no-store")])
             elif path.startswith("/thumb/"):
                 self._thumb(path[len("/thumb/"):])
             elif path.startswith("/download/"):
@@ -1361,7 +1537,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
             payload = json.loads(self.rfile.read(length) or b"{}")
-            new_root = set_download_root(payload.get("download_root") or "")
+            result = update_settings(payload)
         except ValueError as exc:
             self._send(400, json.dumps({"ok": False, "error": str(exc)}),
                        "application/json")
@@ -1370,7 +1546,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"ok": False, "error": str(exc)}),
                        "application/json")
             return
-        self._send(200, json.dumps({"ok": True, "download_root": new_root}),
+        self._send(200, json.dumps(dict(result, ok=True)),
                    "application/json")
 
     def _thumb(self, uuid):
@@ -1501,6 +1677,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def start(port=8000, open_browser=True):
+    enforce_cache_cap(THUMB_DIR, THUMB_CAP)
+    enforce_cache_cap(we_source.THUMB_DIR, THUMB_CAP)
+    if SETTINGS.get("prefill_thumbs"):
+        start_prefill()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = "http://127.0.0.1:%d/" % port
     print("GetWallpaper: %s" % url)

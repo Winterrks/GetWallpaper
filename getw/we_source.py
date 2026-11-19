@@ -53,9 +53,9 @@ DL_DIR = os.path.join(HERE, "we_downloads")
 CACHE_TTL = 6 * 3600
 _CACHE_MEM = {}
 PAGE_SIZE = 30
-MAX_PAGES = 1000
+MAX_PAGES = 1000  # Steam clamps every Workshop browse query to 1,000 pages
 FETCH_WORKERS = max(1, min(16, int(os.environ.get("GETW_FETCH_WORKERS", "10"))))
-THUMB_WIDTH = max(96, min(1024, int(os.environ.get("GETW_THUMB_WIDTH", "400"))))  # Steam clamps every Workshop browse query to 1,000 pages
+THUMB_WIDTH = max(96, min(1024, int(os.environ.get("GETW_THUMB_WIDTH", "400"))))
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 RES_RE = re.compile(r"(\d+)\s*[x\u00d7]\s*(\d+)")

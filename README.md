@@ -20,7 +20,8 @@ It runs entirely on your machine: one Python process, a browser tab on
 - Wallpaper Engine rating filter: Everyone (default), Questionable, Mature, All
 - Infinite scroll through Workshop pages, plus a background fill that indexes the whole Workshop slice (up to Steam's 30,000-item cap)
 - Configurable download folder; files are named after the wallpaper title
-- Thumbnail caches capped at 1 GiB per source, oldest evicted first
+- Adjustable thumbnail cache limit per source (default 1 GiB, oldest-first eviction)
+- Optional background prefill that fills the thumbnail cache automatically
 
 ![Wallpaper Engine source](docs/wallpaper-engine.png)
 
@@ -64,11 +65,17 @@ getw start     # opens http://127.0.0.1:8000
 
 ![Download progress](docs/progress.png)
 
-### Download folder
+### Settings
 
-Click the ⚙ icon in the top-right corner to change it. New folders are created
-and write-checked before saving; the choice is stored in `settings.json` in the
-app data directory.
+Click the ⚙ icon in the top-right corner:
+
+- **Download folder** — created and write-checked before saving
+- **Thumbnail cache limit (MB)** — per source; lowering it immediately evicts
+  the oldest thumbnails
+- **Prefill thumbnails** — warms the cache in the background until it reaches
+  the limit (iWallpaper first, then the Workshop catalogue)
+
+Settings are stored in `settings.json` in the app data directory.
 
 ![Settings dialog](docs/settings.png)
 
@@ -145,7 +152,8 @@ getw status                               # data dir, download folder, caches, S
 | `GETW_DATA_DIR` | Override the state directory (settings, indexes, caches) |
 | `WE_STEAM_ACCOUNT` | Steam account name for SteamCMD (default: auto-detected) |
 | `WE_WORKSHOP_DIR` | Existing `steamapps/workshop/content/431960` folder to copy from |
-| `THUMB_CAP_BYTES` | Thumbnail cache cap per source (default `1073741824` = 1 GiB) |
+| `GETW_FETCH_WORKERS` | Parallel Workshop page fetches during fill (default 10, max 16) |
+| `GETW_THUMB_WIDTH` | Workshop thumbnail width in pixels (default 400) |
 
 ## How it works
 
