@@ -351,6 +351,17 @@ _FILL = {}
 _FILL_LOCK = threading.Lock()
 
 
+def we_records_slice(offset, rating="Everyone"):
+    """Rows from `offset` onward without building rows for the whole catalogue."""
+    rating = rating if rating in WE_RATINGS else "Everyone"
+    with _WE_LOCK:
+        items = we_source.catalog(rating=rating)
+        WE_ITEMS.update({r["id"]: r for r in items})
+    total = len(items)
+    off = max(0, min(int(offset), total))
+    return {"items": _we_rows(items[off:]), "total": total}
+
+
 def fill_status(rating):
     with _FILL_LOCK:
         st = _FILL.get(rating)
@@ -616,7 +627,8 @@ PAGE = r"""<!doctype html>
   @media (max-width: 760px) { #grid { grid-template-columns:repeat(2, minmax(0,1fr)); } }
   .card { position:relative; overflow:hidden; background:var(--card);
           cursor:zoom-in; aspect-ratio:16/9;
-          border-right:1px solid var(--line); border-bottom:1px solid var(--line); }
+          border-right:1px solid var(--line); border-bottom:1px solid var(--line);
+          content-visibility:auto; contain-intrinsic-size:auto 220px; }
   .card img { width:100%; height:100%; object-fit:cover; display:block; background:#000; }
   .card .meta { position:absolute; left:0; right:0; bottom:0; padding:22px 10px 8px; z-index:2;
                 background:linear-gradient(transparent, rgba(0,0,0,.85));
@@ -892,7 +904,6 @@ async function pollFill() {
         if (j.items && j.items.length) {
           records = records.concat(j.items);
           computeFiltered();
-          if (nearPageBottom()) growGrid();
         }
       }
     }
@@ -1237,16 +1248,14 @@ class Handler(BaseHTTPRequestHandler):
                 rating = query.get("rating", ["Everyone"])[0]
                 offset = query.get("offset", [None])[0]
                 try:
-                    rows = we_records(refresh, rating)
                     if offset is not None:
                         try:
-                            off = max(0, int(offset))
+                            off = int(offset)
                         except ValueError:
                             off = 0
-                        payload = json.dumps({"items": rows[off:],
-                                              "total": len(rows)})
+                        payload = json.dumps(we_records_slice(off, rating))
                     else:
-                        payload = json.dumps(rows)
+                        payload = json.dumps(we_records(refresh, rating))
                 except Exception as exc:
                     self._send(500, json.dumps({"ok": False, "error": str(exc)}),
                                "application/json")

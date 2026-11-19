@@ -1,3 +1,3 @@
 """GetWallpaper — local web gallery for live wallpapers."""
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
