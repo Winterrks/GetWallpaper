@@ -776,6 +776,10 @@ PAGE = r"""<!doctype html>
               cursor:pointer; flex:none; }
   #settings:hover { color:var(--txt); border-color:var(--yellow); }
   #settings svg { width:17px; height:17px; }
+  #pfbar { position:absolute; left:0; right:0; bottom:-2px; height:3px;
+           background:rgba(255,255,255,.08); }
+  #pffill { height:100%; width:0; background:var(--yellow);
+            transition:width .3s ease; }
   #rating { background:#000; color:var(--txt); border:1px solid var(--line);
             border-radius:8px; padding:7px 8px; outline:none;
             font:600 12px/1 -apple-system, "SF Pro Text", system-ui, sans-serif; }
@@ -871,6 +875,7 @@ PAGE = r"""<!doctype html>
   </select>
   <input id="q" type="search" placeholder='Search — commas mean AND: "anime, girls, raiden"' autocomplete="off">
   <span id="count"></span>
+  <div id="pfbar" class="hidden" title="Prefilling thumbnails"><div id="pffill"></div></div>
   <button id="settings" title="Download folder">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>
   </button>
@@ -995,6 +1000,29 @@ const moreIO = new IntersectionObserver(
   entries => { if (entries.some(e => e.isIntersecting)) maybeLoadMore(); },
   { rootMargin: '900px 0px' });
 moreIO.observe(moreBar);
+
+const pfBar = document.getElementById('pfbar');
+const pfFill = document.getElementById('pffill');
+
+async function pollPrefill() {
+  try {
+    const res = await fetch('/api/prefill');
+    if (!res.ok) return;
+    const p = await res.json();
+    if (p.running && p.total) {
+      const pct = Math.min(100, Math.round((p.done || 0) * 100 / p.total));
+      pfBar.classList.remove('hidden');
+      pfFill.style.width = pct + '%';
+      pfBar.title = 'Prefilling ' + (p.source || 'thumbnails') + ': ' +
+        (p.done || 0).toLocaleString() + ' / ' + p.total.toLocaleString();
+    } else {
+      pfBar.classList.add('hidden');
+      pfFill.style.width = '0%';
+    }
+  } catch (e) { /* ignore */ }
+}
+pollPrefill();
+setInterval(pollPrefill, 1500);
 
 srcBtns.forEach(b => b.addEventListener('click', () => setSource(b.dataset.src)));
 ratingEl.addEventListener('change', () => {
@@ -1514,6 +1542,9 @@ class Handler(BaseHTTPRequestHandler):
                     urllib.parse.urlparse(self.path).query)
                 rating = query.get("rating", ["Everyone"])[0]
                 self._send(200, json.dumps(fill_status(rating)),
+                           "application/json", [("Cache-Control", "no-store")])
+            elif path == "/api/prefill":
+                self._send(200, json.dumps(dict(PF)),
                            "application/json", [("Cache-Control", "no-store")])
             elif path == "/api/settings":
                 self._send(200, json.dumps(settings_payload()),

@@ -21,7 +21,7 @@ It runs entirely on your machine: one Python process, a browser tab on
 - Infinite scroll through Workshop pages, plus a background fill that indexes the whole Workshop slice (up to Steam's 30,000-item cap)
 - Configurable download folder; files are named after the wallpaper title
 - Adjustable thumbnail cache limit per source (default 1 GiB, oldest-first eviction)
-- Optional background prefill that fills the thumbnail cache automatically
+- Optional background prefill that fills the thumbnail cache automatically, with a progress bar in the header
 
 ![Wallpaper Engine source](docs/wallpaper-engine.png)
 
