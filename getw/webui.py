@@ -175,6 +175,11 @@ def _pf_set(**kw):
         PF.update(kw)
 
 
+def _pf_bump():
+    with _PF_LOCK:
+        PF["done"] = PF.get("done", 0) + 1
+
+
 def _pf_active():
     return PF.get("running") and SETTINGS.get("prefill_thumbs")
 
@@ -199,14 +204,14 @@ def _prefill_worker():
     def fetch_iw(rec):
         try:
             fetch_thumbnail(rec["id"])
-        except Exception:
-            pass
+        finally:
+            _pf_bump()
 
     def fetch_we(rec):
         try:
             we_source.thumbnail(rec["id"], rec["preview"])
-        except Exception:
-            pass
+        finally:
+            _pf_bump()
 
     try:
         _pf_set(source="iWallpaper", total=len(RECORDS), done=0)
@@ -217,9 +222,8 @@ def _prefill_worker():
                 break
             _prefill_gate()
             batch = RECORDS[i:i + 16]
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=8) as pool:
                 list(pool.map(fetch_iw, batch))
-            _pf_set(done=min(len(RECORDS), PF.get("done", 0) + len(batch)))
 
         items = we_source.catalog(rating="Everyone")
         _pf_set(source="Wallpaper Engine", total=len(items), done=0)
@@ -230,9 +234,8 @@ def _prefill_worker():
                 break
             _prefill_gate()
             batch = items[i:i + 16]
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=8) as pool:
                 list(pool.map(fetch_we, batch))
-            _pf_set(done=min(len(items), PF.get("done", 0) + len(batch)))
     except Exception as exc:
         _pf_set(error=str(exc))
     finally:
